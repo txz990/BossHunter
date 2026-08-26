@@ -75,11 +75,103 @@ console = Console()
 # BOSS直聘搜索页 URL 模板
 SEARCH_URL = "https://www.zhipin.com/web/geek/job?query={keyword}&city={city_code}"
 
+# BOSS 直聘「公司规模」筛选的 URL 参数编码（与 ?scale=301,302,... 对应）。
+# 这些值是 BOSS 内部固定的，按列表顺序 0-20 → 10000人以上 递增。
+COMPANY_SIZE_SCALE_CODES = {
+    "0-20人": 301,
+    "20-99人": 302,
+    "100-499人": 303,
+    "500-999人": 304,
+    "1000-9999人": 305,
+    "10000人以上": 306,
+}
+
+# JS: 模拟点击页面顶部「公司规模」筛选器，勾选指定规模后再抓取。
+# 注意：BOSS 直聘的"公司规模"筛选每次勾选一个选项都会立即改 URL (?scale=...) 并刷新
+# 列表（不是一次性多选弹层），所以走 DOM 点击在多选时极不稳定。
+# 现在的做法是直接在 Python 端把 ?scale=... 拼到搜索 URL 上，由 BOSS 服务端一次性返回
+# 筛选结果；这里保留脚本只是为了在 URL 拼不上的情况下做兜底 UI 操作。
+# 入参通过 window.__sizeFilterTargets 传入（字符串数组，如 ["0-20人","20-99人"]）。
+# 返回 "applied:N" / "no-targets" / "no-trigger" / "no-panel" / "not-found:..."。
+JS_APPLY_SIZE_FILTER = r"""
+(() => {
+    const targets = (window.__sizeFilterTargets || []).map(s => String(s).trim());
+    if (!targets.length) return "no-targets";
+
+    const norm = (s) => (s || '').replace(/\s+/g, '');
+
+    // 1) 定位「公司规模」筛选框：沿文本节点向上找最近的 .condition-filter-select
+    let box = null;
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+    let node;
+    while ((node = walker.nextNode())) {
+        if (norm(node.textContent).includes('公司规模')) {
+            let el = node.parentElement;
+            while (el && !(el.className && el.className.includes && el.className.includes('condition-filter-select'))) {
+                el = el.parentElement;
+            }
+            if (el) { box = el; break; }
+        }
+    }
+    if (!box) return "no-trigger";
+    const trigger = box.querySelector('.current-select') || box;
+
+    // 2) 查找弹层选项（每次调用都重新查询，避免 Vue 重渲染后旧引用失效）
+    const findOptions = () => {
+        const inBox = Array.from(box.querySelectorAll('li'));
+        if (inBox.length) return inBox;
+        const pop = box.querySelector('.option-list, .options, ul') || box.nextElementSibling;
+        if (pop) return Array.from(pop.querySelectorAll('li'));
+        return [];
+    };
+
+    // 打开弹层
+    trigger.click();
+
+    // 判断选项是否已选中（避免重复点击反向取消勾选）
+    const isOptionSelected = (opt) => {
+        const cls = opt.className || '';
+        if (cls.includes('active') || cls.includes('selected') || cls.includes('checked') || cls.includes('cur')) return true;
+        if (opt.querySelector('input[type=checkbox]:checked, input[type=radio]:checked')) return true;
+        return false;
+    };
+
+    // 3) 逐个勾选目标规模：每次重新查找选项，点击后 DOM 可能重渲染
+    let matched = 0;
+    const missing = [];
+    for (const target of targets) {
+        let opts = findOptions();
+        let opt = opts.find(o => norm(o.textContent).includes(norm(target)));
+
+        // 面板可能在上一次点击后关闭，回退重开
+        if (!opt) {
+            trigger.click();
+            opts = findOptions();
+            opt = opts.find(o => norm(o.textContent).includes(norm(target)));
+        }
+        if (!opt) { missing.push(target); continue; }
+
+        if (!isOptionSelected(opt)) {
+            opt.click();
+        }
+        matched++;
+    }
+    if (!matched) return "not-found:" + missing.join(',');
+
+    // 4) 点击确定（弹层内的确认按钮，或文本含「确定」「完成」的按钮）
+    const confirm = box.querySelector('.confirm-btn, .btn-confirm, button.confirm')
+        || Array.from(document.querySelectorAll('button')).find(b => { const t = norm(b.textContent); return t.includes('确定') || t.includes('完成'); });
+    if (confirm) confirm.click();
+    return "applied:" + matched + "/" + targets.length;
+})()
+"""
+
 # JS: 从搜索列表页提取岗位卡片数据
 JS_EXTRACT_LIST = r"""
 (() => {
     const wraps = document.querySelectorAll('.job-card-wrap');
     const jobs = [];
+    const sizeRegex = /(\d+-\d+人|\d+人以上|\d+人及以上|少于\d+人|\d+~\d+人|\d+到\d+人|\d+人)/;
     wraps.forEach((wrap) => {
         const box = wrap.querySelector('.job-card-box') || wrap;
         const nameEl = box.querySelector('.job-name');
@@ -91,6 +183,47 @@ JS_EXTRACT_LIST = r"""
 
         if (!nameEl || !href) return;
 
+        // Best-effort: pull company size / industry from the card sub-info so we
+        // can pre-filter without opening the detail page. BOSS cards vary in DOM,
+        // so we scan a broad set of likely containers and then fall back to all
+        // small text fragments in the card.
+        let company_size = '';
+        let company_industry = '';
+
+        // 1st pass: known sub-info selectors
+        const infoSelectors = '.company-location, .company-info, .company-text, .company-tag, .company-tags, .company-desc, .boss-info__description, .job-card-company';
+        const infoEls = box.querySelectorAll(infoSelectors);
+        for (const el of infoEls) {
+            const txt = (el.textContent || '').trim();
+            if (!company_size) {
+                const m = txt.match(sizeRegex);
+                if (m) company_size = m[0];
+            }
+            if (!company_industry && txt.length <= 32 && !txt.includes('人')) {
+                company_industry = txt;
+            }
+        }
+
+        // 2nd pass: if still no size, scan every small text node in the card
+        // (excluding title/salary/tag/location/company-name) to catch variant layouts.
+        if (!company_size) {
+            const excludeSelectors = '.job-name, .job-salary, .tag-list, .company-name, .boss-name, .company-location, button, a';
+            const excludeEls = new Set();
+            box.querySelectorAll(excludeSelectors).forEach(el => excludeEls.add(el));
+            const walker = document.createTreeWalker(box, NodeFilter.SHOW_TEXT, null, false);
+            let node;
+            while ((node = walker.nextNode())) {
+                if (Array.from(excludeEls).some(ex => ex.contains(node))) continue;
+                const txt = (node.textContent || '').trim();
+                if (!txt || txt.length > 64) continue;
+                const m = txt.match(sizeRegex);
+                if (m) {
+                    company_size = m[0];
+                    break;
+                }
+            }
+        }
+
         jobs.push({
             title: nameEl.textContent.trim(),
             salary: salaryEl ? salaryEl.textContent.trim() : '',
@@ -98,6 +231,8 @@ JS_EXTRACT_LIST = r"""
             education: tags[1] ? tags[1].textContent.trim() : '',
             company: companyEl ? companyEl.textContent.trim() : '',
             location: locationEl ? locationEl.textContent.trim() : '',
+            company_size: company_size,
+            company_industry: company_industry,
             url: href
         });
     });
@@ -308,6 +443,14 @@ def scrape_jobs(config: dict, keywords: list[str], limit: int | None = None) -> 
                 sort_mode = search_config.get("sort", "")
                 if sort_mode == "newest":
                     search_url += "&sortType=2"
+                # 公司规模多选：直接在 URL 上拼 ?scale=301,302,... 由 BOSS 服务端筛选。
+                # 走 DOM 点击会因为 BOSS 每次勾选都刷新列表而不可靠（多选变反向取消）。
+                # 注意：scale 必须对每一页都生效，否则第 2 页起会漏掉规模筛选，
+                # 导致返回超出配置范围的岗位。
+                if company_size_filters:
+                    scale_codes = [str(COMPANY_SIZE_SCALE_CODES[s]) for s in company_size_filters if s in COMPANY_SIZE_SCALE_CODES]
+                    if scale_codes:
+                        search_url += "&scale=" + ",".join(scale_codes)
                 if page > 1:
                     search_url += f"&page={page}"
 
@@ -320,6 +463,23 @@ def scrape_jobs(config: dict, keywords: list[str], limit: int | None = None) -> 
 
                 time.sleep(3)
                 wait_for_load(target_id, timeout=10)
+
+                # 兜底：如果配置的规模值没有可识别的 scale 编码，回退到点击页面筛选器。
+                # 正常情况下不会走到这里（所有规模标签都在 COMPANY_SIZE_SCALE_CODES 里）。
+                if company_size_filters and page == 1 and not any(
+                    s in COMPANY_SIZE_SCALE_CODES for s in company_size_filters
+                ):
+                    try:
+                        evaluate(target_id, f"window.__sizeFilterTargets = {json.dumps(company_size_filters, ensure_ascii=False)};")
+                        time.sleep(1.0)  # 等搜索页 Vue 完全渲染后再操作筛选器
+                        apply_result = evaluate(target_id, JS_APPLY_SIZE_FILTER)
+                        if apply_result and apply_result.startswith("applied"):
+                            time.sleep(2)
+                            progress.update(task, description=f"搜索: {label} (已应用规模筛选 {company_size_filters} -> {apply_result})")
+                        else:
+                            progress.update(task, description=f"搜索: {label} (规模筛选UI未匹配: {apply_result}，回退到列表页过滤)")
+                    except Exception:
+                        pass
 
                 # Scroll to load all results on this page
                 scroll(target_id, y=2000)
@@ -367,6 +527,12 @@ def scrape_jobs(config: dict, keywords: list[str], limit: int | None = None) -> 
                     if matching_deal_breaker(job_data.get("title", ""), deal_breakers):
                         continue
 
+                    # Pre-filter by company size using list-page data (avoids a detail-page request)
+                    list_size = job_data.get("company_size", "")
+                    if company_size_filters and list_size and not _match_company_size(list_size, company_size_filters):
+                        progress.update(task, description=f"搜索: {label} 第{page}页 (列表页过滤规模 {list_size})")
+                        continue
+
                     # Open detail page for full JD
                     throttle.wait()
                     detail_url = f"https://www.zhipin.com{job_url}"
@@ -401,12 +567,12 @@ def scrape_jobs(config: dict, keywords: list[str], limit: int | None = None) -> 
                         "hr_name": detail.get("hr_name", ""),
                         "hr_title": detail.get("hr_title", ""),
                         "hr_active": detail.get("hr_active", ""),
-                        "company_size": detail.get("company_size", ""),
+                        "company_size": detail.get("company_size", "") or list_size,
                         "company_industry": detail.get("company_industry", ""),
                         "url": detail_url,
                     }
 
-                    # Apply company size filter
+                    # Fallback filter: if list page lacked size, rely on detail page
                     if not _match_company_size(job_record.get("company_size", ""), company_size_filters):
                         continue
 

@@ -1,6 +1,8 @@
 """AI Scorer - Match jobs against resume using Claude API."""
 
 import json
+import random
+import time
 from pathlib import Path
 
 from rich.console import Console
@@ -58,7 +60,7 @@ def _load_resume(config: dict) -> str:
 
 
 def _call_claude(prompt: str, config: dict, max_tokens: int | None = None) -> str | None:
-    """Call Claude API and return response text."""
+    """Call Claude API and return response text, with rate-limit backoff."""
     if not get_ai_api_key(config):
         console.print("[red]未设置当前 AI 服务所需的 API Key 环境变量或 config.yaml ai.api_key[/red]")
         return None
@@ -68,16 +70,39 @@ def _call_claude(prompt: str, config: dict, max_tokens: int | None = None) -> st
         token_limit = max(128, min(int(token_limit or 8192), 65536))
     except (TypeError, ValueError):
         token_limit = 8192
-    return run_cancellable(
-        lambda: call_anthropic_text(
-            prompt,
-            config,
-            token_limit,
-            timeout=ai_cfg.get("scoring_timeout_seconds", ai_cfg.get("timeout_seconds", 180)),
-            purpose="scoring",
-        ),
-        config,
-    )
+    timeout = ai_cfg.get("scoring_timeout_seconds", ai_cfg.get("timeout_seconds", 180))
+    max_rate_retries = max(1, min(int(ai_cfg.get("rate_limit_max_retries", 3) or 3), 8))
+    base_backoff = float(ai_cfg.get("rate_limit_backoff_seconds", 10) or 10)
+    stop_event = config.get("_workbench_stop_event")
+    for attempt in range(max_rate_retries + 1):
+        try:
+            return run_cancellable(
+                lambda: call_anthropic_text(
+                    prompt,
+                    config,
+                    token_limit,
+                    timeout=timeout,
+                    purpose="scoring",
+                ),
+                config,
+            )
+        except AIRequestError as exc:
+            if exc.kind != "rate_limit" or attempt >= max_rate_retries:
+                raise
+            # 指数退避：第 n 次重试等待 base * 2^n 秒（含随机抖动），
+            # 比固定等待更能消化服务商的 RPM/TPM 限流窗口。
+            backoff = base_backoff * (2 ** attempt) * random.uniform(0.8, 1.2)
+            _notify(
+                config,
+                f"AI 触发请求频率限制（RPM/TPM），等待 {int(backoff)}s 后重试（{attempt + 1}/{max_rate_retries}）...",
+            )
+            slept = 0
+            while slept < backoff:
+                if stop_event is not None and stop_event.is_set():
+                    raise
+                time.sleep(1)
+                slept += 1
+    return None
 
 
 def _truncate_prompt_text(text: str, limit: int) -> str:
@@ -199,6 +224,7 @@ def score_jobs(config: dict, *, rescore_filtered: bool = False) -> tuple[int, in
         processed = 0
         failed = 0
         pause_reason = ""
+        auth_warned = False
 
         with Progress(
             SpinnerColumn(),
@@ -247,8 +273,10 @@ def score_jobs(config: dict, *, rescore_filtered: bool = False) -> tuple[int, in
                                         f"已跳过 {job['company']}｜{job['title']}：调整单次 Token 请求后仍无法获得完整评分。",
                                     )
                                     continue
-                                pause_reason = retry_exc.user_message
-                                break
+                                _notify(config, f"已跳过 {job['company']}｜{job['title']}：{retry_exc.user_message}")
+                                failed += 1
+                                _record_score_failure(db, job, retry_exc.user_message)
+                                continue
                         elif exc.kind == "output_limit":
                             _notify(config, f"{job['company']}｜{job['title']} 正在降低输出 Token 上限后重试评分。")
                             try:
@@ -262,23 +290,52 @@ def score_jobs(config: dict, *, rescore_filtered: bool = False) -> tuple[int, in
                                         f"已跳过 {job['company']}｜{job['title']}：当前模型仍不接受输出 Token 设置。",
                                     )
                                     continue
-                                pause_reason = retry_exc.user_message
-                                break
-                        elif exc.kind != "context_limit":
-                            pause_reason = exc.user_message
-                            break
-                        else:
+                                _notify(config, f"已跳过 {job['company']}｜{job['title']}：{retry_exc.user_message}")
+                                failed += 1
+                                _record_score_failure(db, job, retry_exc.user_message)
+                                continue
+                        elif exc.kind == "context_limit":
                             _notify(config, f"{job['company']}｜{job['title']} 内容较长，正在压缩后重试评分。")
                             try:
                                 response = _call_claude(_build_scoring_prompt(job, resume, compact=True), config, 128)
                             except AIRequestError as retry_exc:
                                 if retry_exc.kind != "context_limit":
-                                    pause_reason = retry_exc.user_message
-                                    break
+                                    _notify(config, f"已跳过 {job['company']}｜{job['title']}：{retry_exc.user_message}")
+                                    failed += 1
+                                    _record_score_failure(db, job, retry_exc.user_message)
+                                    continue
                                 failed += 1
                                 _record_score_failure(db, job, "压缩请求后仍超过模型上下文限制")
                                 _notify(config, f"已跳过 {job['company']}｜{job['title']}：压缩后仍超过模型上下文限制。")
                                 continue
+                        elif exc.kind == "rate_limit":
+                            # 全局限流：不标记单岗位失败，而是暂停整个评分循环，避免
+                            # 在限流窗口内继续猛发请求、把剩余岗位也白白标记成失败。
+                            # 已完成的结果已保存，剩余 pending 岗位下次重跑评分会继续。
+                            pause_reason = (
+                                f"AI 服务触发请求频率限制，已暂停评分（{exc.user_message}）。"
+                                f"可稍后重新运行评分继续处理剩余岗位。"
+                            )
+                            break
+                        elif exc.kind in {"auth", "network", "request_failed", "token_quota"}:
+                            # Per-job failure: record and continue so other jobs still get scored.
+                            # On the first auth/quota problem, surface a clear, actionable warning.
+                            if not auth_warned and exc.kind in {"auth", "token_quota"}:
+                                auth_warned = True
+                                _notify(
+                                    config,
+                                    f"⚠ AI 鉴权/配额失败（{exc.user_message}）。请检查 AI 设置中的服务商与 API Key 是否正确，"
+                                    f"本次评分将跳过相关岗位并保留为待处理，修复后可重跑评分。",
+                                    error=True,
+                                )
+                            else:
+                                _notify(config, f"已跳过 {job['company']}｜{job['title']}：{exc.user_message}")
+                            failed += 1
+                            _record_score_failure(db, job, exc.user_message)
+                            continue
+                        else:
+                            pause_reason = exc.user_message
+                            break
 
                     if not response:
                         result = None
@@ -297,9 +354,27 @@ def score_jobs(config: dict, *, rescore_filtered: bool = False) -> tuple[int, in
                         try:
                             response = _call_claude(_build_scoring_prompt(job, resume), config)
                         except AIRequestError as retry_exc:
-                            if retry_exc.kind in {"token_quota", "rate_limit", "auth", "network", "request_failed"}:
-                                pause_reason = retry_exc.user_message
+                            if retry_exc.kind == "rate_limit":
+                                # 全局限流：暂停整个评分循环（同上），不逐个标记失败。
+                                pause_reason = (
+                                    f"AI 服务触发请求频率限制，已暂停评分（{retry_exc.user_message}）。"
+                                    f"可稍后重新运行评分继续处理剩余岗位。"
+                                )
                                 break
+                            if retry_exc.kind in {"token_quota", "auth", "network", "request_failed"}:
+                                if not auth_warned and retry_exc.kind in {"auth", "token_quota"}:
+                                    auth_warned = True
+                                    _notify(
+                                        config,
+                                        f"⚠ AI 鉴权/配额失败（{retry_exc.user_message}）。请检查 AI 设置中的服务商与 API Key 是否正确，"
+                                        f"本次评分将跳过相关岗位并保留为待处理，修复后可重跑评分。",
+                                        error=True,
+                                    )
+                                else:
+                                    _notify(config, f"已跳过 {job['company']}｜{job['title']}：{retry_exc.user_message}")
+                                failed += 1
+                                _record_score_failure(db, job, retry_exc.user_message)
+                                continue
                             response = None
                         result = _validated_score_result(response) if response else None
 

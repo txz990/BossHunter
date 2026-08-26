@@ -79,10 +79,16 @@ class WebApiRouteTests(unittest.TestCase):
             "wsgi.run_once": False,
         }
 
-        body = b"".join(
-            chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
-            for chunk in server.app(environ, start_response)
-        ).decode("utf-8")
+        app_iter = server.app(environ, start_response)
+        try:
+            body = b"".join(
+                chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+                for chunk in app_iter
+            ).decode("utf-8")
+        finally:
+            close = getattr(app_iter, "close", None)
+            if callable(close):
+                close()
         return status_headers["status"], status_headers["headers"], body
 
     def _upload_resume(self, filename: str, content: bytes, content_type: str):
@@ -417,6 +423,22 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(status_after_stop["active"]["id"], task["id"])
         self.assertEqual(status_after_stop["active"]["status"], "stopping")
         self.assertEqual(second_task["mode"], "monitor")
+
+    def test_task_runner_stop_wakes_monitor_interval_wait(self):
+        # Arrange
+        wakeup_event = Event()
+        task = WorkbenchTask(id="monitor-task", mode="monitor", label="单独监测")
+        task.context["monitor_wakeup_event"] = wakeup_event
+        runner = WorkbenchTaskRunner()
+        runner._tasks[task.id] = task
+
+        # Act
+        stopped = runner.stop(task.id)
+
+        # Assert
+        self.assertEqual(stopped["status"], "stopping")
+        self.assertTrue(stopped["stop_requested"])
+        self.assertTrue(wakeup_event.is_set())
 
     def test_task_runner_automatically_stops_at_send_window_deadline(self):
         # Arrange

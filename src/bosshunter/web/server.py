@@ -15,7 +15,7 @@ from threading import Event, Lock
 from bottle import Bottle, request, response, static_file, abort
 
 from bosshunter import __version__
-from bosshunter.ai.credentials import get_ai_api_key
+from bosshunter.ai.credentials import get_ai_api_key, list_ai_models
 from bosshunter.config import AI_SERVICE_PRESETS, CITY_CODES, load_config
 from bosshunter.db import (
 	add_history,
@@ -37,6 +37,12 @@ from bosshunter.db import (
 from bosshunter.web.preflight import check_ai_connection, collect_preflight_checks, error_messages
 from bosshunter.web.resume_upload import ResumeUploadError, prepare_resume_content
 from bosshunter.web.tasks import TaskAlreadyRunningError, WorkbenchTask, WorkbenchTaskRunner
+from bosshunter.web.ai_presets import (
+    delete_preset,
+    get_preset,
+    list_presets,
+    save_preset,
+)
 
 mimetypes.add_type("application/javascript", ".js", strict=True)
 mimetypes.add_type("application/javascript", ".mjs", strict=True)
@@ -607,6 +613,71 @@ def api_ai_diagnostics():
 		return _json_response({"ok": False, "messages": [str(e)]}, 500)
 
 
+@app.route("/api/ai/models")
+def api_ai_models():
+	try:
+		models = list_ai_models(load_config(CONFIG_PATH))
+		return _json_response({"ok": True, "models": models})
+	except Exception as e:
+		return _json_response({"ok": False, "error": str(e)}, 400)
+
+
+# ─── AI Presets (saved AI setting profiles) ──────────────
+
+@app.route("/api/ai/presets")
+def api_ai_presets_list():
+	"""List saved AI setting presets (credentials masked)."""
+	try:
+		return _json_response({"ok": True, "presets": list_presets()})
+	except Exception as e:
+		return _json_response({"ok": False, "error": str(e)}, 500)
+
+
+@app.route("/api/ai/presets/<name>")
+def api_ai_preset_get(name):
+	"""Return a single preset's full settings so the frontend can apply them."""
+	try:
+		preset = get_preset(name)
+		if preset is None:
+			return _json_response({"ok": False, "error": "未找到该 AI 配置"}, 404)
+		preset.pop("updated_at", None)
+		return _json_response({"ok": True, "preset": preset})
+	except Exception as e:
+		return _json_response({"ok": False, "error": str(e)}, 500)
+
+
+@app.route("/api/ai/presets", method="POST")
+def api_ai_presets_save():
+	"""Save the current AI settings under an alias name."""
+	try:
+		body = request.json or {}
+		name = str(body.get("name") or "").strip()
+		config = load_config(CONFIG_PATH)
+		# Allow overriding the source config with posted ai.* fields so the
+		# frontend can save unsaved edits directly from the form.
+		posted_ai = body.get("ai")
+		if isinstance(posted_ai, dict) and posted_ai:
+			config["ai"] = posted_ai
+		preset = save_preset(name, config)
+		return _json_response({"ok": True, "preset": preset})
+	except ValueError as e:
+		return _json_response({"ok": False, "error": str(e)}, 400)
+	except Exception as e:
+		return _json_response({"ok": False, "error": str(e)}, 500)
+
+
+@app.route("/api/ai/presets/<name>", method="DELETE")
+def api_ai_presets_delete(name):
+	"""Delete a saved preset by alias name."""
+	try:
+		deleted = delete_preset(name)
+		if not deleted:
+			return _json_response({"ok": False, "error": "未找到该 AI 配置"}, 404)
+		return _json_response({"ok": True, "success": True})
+	except Exception as e:
+		return _json_response({"ok": False, "error": str(e)}, 500)
+
+
 @app.route("/api/workbench/task", method="POST")
 def api_workbench_task_start():
 	try:
@@ -894,7 +965,9 @@ def api_resume_get():
 		if resume_path and Path(resume_path).exists():
 			p = Path(resume_path)
 			stat = p.stat()
-			original = config.get("profile", {}).get("resume_original_filename", "") or p.name
+			# resume_original_filename 来自浏览器上传时的原始文件名，用户重命名后可能与
+			# 存储文件名不一致，页面显示应以磁盘上的实际文件名为准。
+			original = p.name
 			return _json_response({
 				"filename": p.name,
 				"original_filename": original,

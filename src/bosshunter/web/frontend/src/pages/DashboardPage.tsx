@@ -437,7 +437,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
   }
 
   if (view === 'monitor') {
-    return <MonitorExecutionView history={history} refresh={refresh} />
+    return <MonitorExecutionView history={history} task={activeTask} lastTask={workbench.last_task} refresh={refresh} stopTask={stopTask} />
   }
 
   return (
@@ -638,12 +638,12 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
       )}
 
       <section className="rounded-3xl border border-card-border bg-white p-5">
-        <div className="mb-4 flex flex-wrap items-center justify-between gap-4">
+        <div className="sticky -top-6 z-30 -mx-5 -mt-5 mb-4 flex flex-wrap items-center justify-between gap-4 border-b border-card-border bg-white px-5 py-4 shadow-sm">
           <div>
             <h3 className="text-lg font-black">今日待确认</h3>
             <p className="mt-1 text-xs text-muted">展示需要你人工确认是否推进投递的岗位，支持全选、部分选择、一键投递。</p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button variant="secondary" size="sm" onClick={() => setSelected(todayJobs.map(job => job.id))}>全选</Button>
             <Button variant="secondary" size="sm" onClick={() => setSelected([])}>清空</Button>
             <Button variant="secondary" size="sm" onClick={() => rejectSelectedJobs(selected)}>放弃已选 {selected.length} 个</Button>
@@ -950,7 +950,19 @@ function latestHrText(item: HistoryItem) {
   return parsed.hrQuestion || latestHr?.text || ''
 }
 
-function MonitorExecutionView({ history, refresh }: { history: HistoryItem[]; refresh: () => Promise<void> }) {
+function MonitorExecutionView({
+  history,
+  task,
+  lastTask,
+  refresh,
+  stopTask,
+}: {
+  history: HistoryItem[]
+  task: WorkbenchTask | null
+  lastTask: WorkbenchTask | null
+  refresh: () => Promise<void>
+  stopTask: (taskId: string) => Promise<void>
+}) {
   const pendingReplies = uniqueLatestByJob(history.filter(item =>
     item.action === 'reply_pending' && !isReplyPendingResolved(item, history)
   ))
@@ -982,6 +994,23 @@ function MonitorExecutionView({ history, refresh }: { history: HistoryItem[]; re
     : visibleHistory.slice(0, 8)
   const [replyDrafts, setReplyDrafts] = useState<Record<number, string>>({})
   const [notice, setNotice] = useState('')
+  const [stoppingTask, setStoppingTask] = useState(false)
+  const visibleTask = task || lastTask
+
+  const stopActiveTask = async () => {
+    if (!task || stoppingTask) return
+    if (!window.confirm(`是否停止当前${task.label}任务？已入库岗位会保留。`)) return
+    try {
+      setStoppingTask(true)
+      setNotice(`正在停止${task.label}...`)
+      await stopTask(task.id)
+      setNotice(`${task.label}已请求停止。`)
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '停止失败')
+    } finally {
+      setStoppingTask(false)
+    }
+  }
 
   const draftFor = (item: HistoryItem) => {
     const parsed = parseHistoryDetail(item)
@@ -1026,10 +1055,28 @@ function MonitorExecutionView({ history, refresh }: { history: HistoryItem[]; re
       <div className="mb-4 flex items-start justify-between gap-4">
         <div>
           <h2 className="text-2xl font-black">监测执行</h2>
-          <p className="mt-1 text-sm text-muted">这里不启动监测，只处理监测发现的 HR 问题、回复建议和结果。</p>
+          <p className="mt-1 text-sm text-muted">这里处理监测发现的 HR 问题、回复建议和结果；后台监测运行时可在此直接停止。</p>
         </div>
         <span className="rounded-full bg-[#FFF0E5] px-3 py-2 text-xs font-black text-primary">待处理 {pendingItems.length}</span>
       </div>
+      {visibleTask && (
+        <div className={`mb-4 rounded-2xl border px-4 py-3 ${taskStatusClass(visibleTask.status)}`}>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="text-xs font-black text-primary">后台任务</div>
+              <div className="mt-1 text-base font-black text-foreground">{visibleTask.label}｜{taskStatusText(visibleTask.status)}</div>
+              <div className="mt-1 text-xs text-muted">{currentTaskStage(visibleTask.logs)}</div>
+            </div>
+            {task && (
+              <Button variant="secondary" size="sm" disabled={stoppingTask || task.status === 'stopping'} onClick={stopActiveTask}>
+                <Square className="mr-2 h-4 w-4 fill-current" />
+                {task.status === 'stopping' ? '停止中' : '停止当前任务'}
+              </Button>
+            )}
+          </div>
+          {visibleTask.stop_reason && <div className="mt-2 text-xs font-bold text-primary">{visibleTask.stop_reason}</div>}
+        </div>
+      )}
       <div className="mb-4 flex flex-wrap gap-2">
         {[
           { key: 'pending' as const, label: '待处理', count: pendingItems.length },

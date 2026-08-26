@@ -6,7 +6,7 @@ import { Switch } from '@/components/ui/switch'
 import { Slider } from '@/components/ui/slider'
 import { TagsInput } from '@/components/ui/tags-input'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
-import { Save, RotateCcw, Upload, Trash2, ChevronDown, ChevronRight } from 'lucide-react'
+import { Save, RotateCcw, Upload, Trash2, ChevronDown, ChevronRight, BookMarked, Plus } from 'lucide-react'
 import { useState, useEffect } from 'react'
 
 // City options
@@ -65,9 +65,18 @@ export default function ConfigPage() {
   const [resumeUploadError, setResumeUploadError] = useState('')
   const [isDragging, setIsDragging] = useState(false)
   const [aiTest, setAiTest] = useState<{ testing: boolean; ok?: boolean; message?: string }>({ testing: false })
+  const [modelList, setModelList] = useState<string[]>([])
+  const [modelLoading, setModelLoading] = useState(false)
+  const [modelError, setModelError] = useState('')
+  const [aiPresets, setAiPresets] = useState<{ name: string; settings: any; updated_at: string }[]>([])
+  const [presetAlias, setPresetAlias] = useState('')
+  const [presetError, setPresetError] = useState('')
+  const [presetMessage, setPresetMessage] = useState('')
+  const [presetLoading, setPresetLoading] = useState(false)
 
   useEffect(() => {
     fetch('/api/resume').then(r => r.json()).then(setResumeInfo).catch(() => {})
+    fetchAiPresets()
   }, [])
 
   const toggleSection = (key: string) => {
@@ -137,6 +146,35 @@ export default function ConfigPage() {
     }
   }
 
+  const handleFetchModels = async () => {
+    if (dirty) {
+      setModelError('请先保存当前配置，再拉取模型列表。')
+      setModelList([])
+      return
+    }
+    setModelLoading(true)
+    setModelError('')
+    try {
+      const res = await fetch('/api/ai/models', { cache: 'no-store' })
+      const data = await res.json()
+      if (!res.ok || !data.ok) {
+        setModelError(data.error || '拉取模型列表失败')
+        setModelList([])
+        return
+      }
+      const models = Array.isArray(data.models) ? data.models : []
+      setModelList(models)
+      if (models.length === 0) {
+        setModelError('上游接口未返回可用模型，请手动填写模型名称。')
+      }
+    } catch {
+      setModelError('无法连接本地接口，请确认 BossHunter 后端正在运行。')
+      setModelList([])
+    } finally {
+      setModelLoading(false)
+    }
+  }
+
   const handleAiServiceChange = (service: AiService) => {
     const currentService = (config?.ai?.service || (config?.ai?.provider === 'openai_compatible' ? 'custom' : 'anthropic')) as AiService
     if (service === currentService) return
@@ -156,6 +194,112 @@ export default function ConfigPage() {
     updateConfig('ai.auth_token_masked', '')
     updateConfig('ai.clear_credentials', true)
     setAiTest({ testing: false })
+    setModelList([])
+    setModelError('')
+  }
+
+  const fetchAiPresets = async () => {
+    try {
+      const res = await fetch('/api/ai/presets', { cache: 'no-store' })
+      const data = await res.json()
+      if (res.ok && data.ok && Array.isArray(data.presets)) {
+        setAiPresets(data.presets)
+      }
+    } catch {
+      // Presets are optional; ignore fetch failures silently.
+    }
+  }
+
+  const applyAiPreset = async (name: string) => {
+    if (!name) return
+    setPresetError('')
+    setPresetMessage('')
+    try {
+      const res = await fetch(`/api/ai/presets/${encodeURIComponent(name)}`, { cache: 'no-store' })
+      const data = await res.json()
+      if (!res.ok || !data.ok || !data.preset) {
+        setPresetError(data.error || '加载 AI 配置失败')
+        return
+      }
+      const p = data.preset
+      updateConfig('ai.service', p.service || '')
+      updateConfig('ai.provider', p.provider || '')
+      updateConfig('ai.model', p.model || '')
+      updateConfig('ai.base_url', p.base_url || '')
+      updateConfig('ai.api_key', p.api_key || '')
+      updateConfig('ai.auth_token', p.auth_token || '')
+      updateConfig('ai.thinking', p.thinking || 'auto')
+      updateConfig('ai.thinking_budget', p.thinking_budget ?? 2048)
+      updateConfig('ai.timeout_seconds', p.timeout_seconds ?? 180)
+      updateConfig('ai.scoring_max_tokens', p.scoring_max_tokens ?? 8192)
+      updateConfig('ai.scoring_max_attempts', p.scoring_max_attempts ?? 2)
+      updateConfig('ai.greeting_max_tokens', p.greeting_max_tokens ?? 8192)
+      updateConfig('ai.greeting_review_max_tokens', p.greeting_review_max_tokens ?? 4096)
+      updateConfig('ai.greeting_max_attempts', p.greeting_max_attempts ?? 2)
+      updateConfig('ai.greeting_review_threshold', p.greeting_review_threshold ?? 7.0)
+      updateConfig('ai.greeting_max_iterations', p.greeting_max_iterations ?? 2)
+      setPresetAlias(name)
+      setAiTest({ testing: false })
+      setModelList([])
+      setModelError('')
+      setPresetMessage(`已载入配置「${name}」，记得点击右上角“保存”使其生效。`)
+    } catch {
+      setPresetError('无法连接本地接口，请确认 BossHunter 后端正在运行。')
+    }
+  }
+
+  const saveAiPreset = async () => {
+    const alias = presetAlias.trim()
+    if (!alias) {
+      setPresetError('请先填写用于区分配置的别名名称')
+      return
+    }
+    setPresetError('')
+    setPresetMessage('')
+    setPresetLoading(true)
+    try {
+      const ai = config?.ai || {}
+      const res = await fetch('/api/ai/presets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: alias, ai }),
+      })
+      const data = await res.json()
+      if (!res.ok || !data.ok) {
+        setPresetError(data.error || '保存 AI 配置失败')
+        return
+      }
+      setPresetMessage(`AI 配置「${alias}」已保存`)
+      await fetchAiPresets()
+    } catch {
+      setPresetError('无法连接本地接口，请确认 BossHunter 后端正在运行。')
+    } finally {
+      setPresetLoading(false)
+    }
+  }
+
+  const deleteAiPreset = async () => {
+    const alias = presetAlias.trim()
+    if (!alias) {
+      setPresetError('请先选择或填写要删除的配置别名')
+      return
+    }
+    if (!window.confirm(`确定删除 AI 配置「${alias}」吗？`)) return
+    setPresetError('')
+    setPresetMessage('')
+    try {
+      const res = await fetch(`/api/ai/presets/${encodeURIComponent(alias)}`, { method: 'DELETE' })
+      const data = await res.json()
+      if (!res.ok || !data.ok) {
+        setPresetError(data.error || '删除失败')
+        return
+      }
+      setPresetAlias('')
+      setPresetMessage(`AI 配置「${alias}」已删除`)
+      await fetchAiPresets()
+    } catch {
+      setPresetError('无法连接本地接口，请确认 BossHunter 后端正在运行。')
+    }
   }
 
   if (loading) {
@@ -361,6 +505,50 @@ export default function ConfigPage() {
         {/* AI Section */}
         <SectionCard title="AI 设置" sectionKey="ai" expanded={expandedSections} toggle={toggleSection}>
           <div className="space-y-4">
+            {/* Saved AI presets */}
+            <div className="rounded-2xl border border-card-border bg-[#FFFCFA] p-3">
+              <div className="mb-2 flex items-center gap-2">
+                <BookMarked className="h-4 w-4 text-primary" />
+                <span className="text-sm font-black text-foreground">已保存的 AI 配置</span>
+              </div>
+              <Field label="选择已有配置">
+                <Select
+                  value=""
+                  onChange={e => {
+                    const name = e.target.value
+                    e.target.value = ''
+                    if (name) applyAiPreset(name)
+                  }}
+                >
+                  <option value="">选择后自动填入下方设置（需保存生效）</option>
+                  {aiPresets.map(preset => (
+                    <option key={preset.name} value={preset.name}>{preset.name}</option>
+                  ))}
+                </Select>
+              </Field>
+              <div className="mt-3 grid gap-3 md:grid-cols-[1fr_auto_auto]">
+                <Field label="别名名称（用于区分）">
+                  <Input
+                    value={presetAlias}
+                    onChange={e => { setPresetAlias(e.target.value); setPresetError('') }}
+                    placeholder="如：DeepSeek-日常 / 豆包-正式"
+                  />
+                </Field>
+                <div className="flex items-end gap-2">
+                  <Button variant="secondary" size="sm" onClick={saveAiPreset} disabled={presetLoading}>
+                    <Plus className="w-3 h-3 mr-1" />{presetLoading ? '保存中...' : '保存为配置'}
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={deleteAiPreset}>
+                    <Trash2 className="w-3 h-3 mr-1" />删除
+                  </Button>
+                </div>
+              </div>
+              <p className="mt-2 text-xs text-muted">
+                将当前 AI 设置的各项内容保存为带别名的配置，方便之后下拉一键切换。
+              </p>
+              {presetError && <p className="mt-2 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-500">{presetError}</p>}
+              {presetMessage && <p className="mt-2 rounded-lg bg-green-50 px-3 py-2 text-xs text-green-700">{presetMessage}</p>}
+            </div>
             <Field label="提供商">
               <Select
                 value={config.ai?.service || (config.ai?.provider === 'openai_compatible' ? 'custom' : 'anthropic')}
@@ -377,10 +565,31 @@ export default function ConfigPage() {
               </p>
             </Field>
             <Field label="模型名称">
-              <Input value={config.ai?.model || ''} onChange={e => {
-                updateConfig('ai.model', e.target.value)
-                setAiTest({ testing: false })
-              }} placeholder="填写服务商当前支持的模型 ID" />
+              <div className="flex items-center gap-2">
+                {modelList.length > 0 ? (
+                  <Select
+                    value={config.ai?.model || ''}
+                    onChange={e => {
+                      updateConfig('ai.model', e.target.value)
+                      setAiTest({ testing: false })
+                    }}
+                  >
+                    <option value="">手动输入或选择模型</option>
+                    {modelList.map(m => (
+                      <option key={m} value={m}>{m}</option>
+                    ))}
+                  </Select>
+                ) : (
+                  <Input value={config.ai?.model || ''} onChange={e => {
+                    updateConfig('ai.model', e.target.value)
+                    setAiTest({ testing: false })
+                  }} placeholder="填写服务商当前支持的模型 ID" />
+                )}
+                <Button variant="secondary" size="sm" onClick={handleFetchModels} disabled={modelLoading || dirty}>
+                  {modelLoading ? '拉取中...' : '拉取模型'}
+                </Button>
+              </div>
+              {modelError && <p className="mt-1 text-xs text-red-500">{modelError}</p>}
             </Field>
             <Field label="API Key">
               <Input type="password" value={config.ai?.api_key || ''} onChange={e => {

@@ -354,10 +354,83 @@ def get_ai_base_url(config: dict) -> str | None:
     if service == "custom":
         return (
             os.environ.get("OPENAI_BASE_URL")
-            or os.environ.get("ANTHROPIC_BASE_URL")
             or ai_cfg.get("base_url")
+            or os.environ.get("ANTHROPIC_BASE_URL")
         )
     return os.environ.get("ANTHROPIC_BASE_URL") or ai_cfg.get("base_url")
+
+
+def list_ai_models(config: dict) -> list[str]:
+	"""Fetch available model IDs from the upstream provider's models endpoint.
+
+	Returns a list of model id strings. Raises on network/HTTP errors so the
+	caller can surface a meaningful message to the user.
+	"""
+	import httpx
+
+	ai_cfg = config.get("ai", {}) if isinstance(config, dict) else {}
+	service = get_ai_service(config)
+	provider = str(ai_cfg.get("provider") or "anthropic")
+	base_url = get_ai_base_url(config)
+	credential = get_ai_api_key(config)
+
+	if not credential:
+		raise ValueError("尚未填写 AI API Key")
+	if not base_url:
+		raise ValueError("缺少 Base URL，无法拉取模型列表")
+
+	if provider == "openai_compatible":
+		models_url = f"{base_url.rstrip('/')}/models"
+		headers = {"Authorization": f"Bearer {credential}"}
+	else:
+		models_url = (
+			f"{base_url.rstrip('/')}/v1/models"
+			if base_url
+			else "https://api.anthropic.com/v1/models"
+		)
+		auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN") or ai_cfg.get("auth_token")
+		headers = (
+			{"Authorization": f"Bearer {auth_token}"}
+			if auth_token
+			else {"x-api-key": str(credential)}
+		)
+		headers["anthropic-version"] = "2023-06-01"
+
+	resp = httpx.get(models_url, headers=headers, timeout=10, follow_redirects=True)
+	if resp.status_code == 401:
+		raise ValueError("鉴权失败（401）：API Key 无效或缺少授权，请检查填写的 API Key 是否正确。")
+	if resp.status_code == 403:
+		raise ValueError("无权限访问（403）：当前 API Key 无权调用该接口的模型列表。")
+	if resp.status_code in {404, 405}:
+		raise ValueError(
+			"该上游接口未提供模型列表端点（404/405）。"
+			"请确认 Base URL 是否正确（通常只需填到 /v1，不要包含 /models）。"
+		)
+	if resp.status_code >= 400:
+		raise ValueError(f"上游返回错误（{resp.status_code}）：{resp.text[:200]}")
+	resp.raise_for_status()
+	data = resp.json()
+
+	# OpenAI-compatible: {"data": [{"id": "..."}]}
+	if isinstance(data, dict) and isinstance(data.get("data"), list):
+		ids = [
+			item.get("id", "")
+			for item in data["data"]
+			if isinstance(item, dict) and item.get("id")
+		]
+		return ids
+	# Anthropic: {"data": [{"id": "...", "type": "model"}]}
+	if isinstance(data, dict) and isinstance(data.get("data"), list):
+		ids = [
+			item.get("id", "")
+			for item in data["data"]
+			if isinstance(item, dict) and item.get("id")
+		]
+		return ids
+	# Anthropic legacy/paginated: {"models": [...]}
+	if isinstance(data, dict) and isinstance(data.get("models"), list):
+		return [str(m) for m in data["models"] if m]
+	raise ValueError("上游接口返回的模型列表格式无法识别")
 
 
 def build_anthropic_client_kwargs(config: dict) -> dict:
@@ -520,6 +593,10 @@ def call_openai_compatible_text(
             response.raise_for_status()
         except Exception as exc:
             if _is_thinking_compatibility_error(exc, response):
+                thinking_rejected = True
+                compatibility_error = exc
+                continue
+            if "thinking" in overrides and isinstance(exc, httpx.RequestError):
                 thinking_rejected = True
                 compatibility_error = exc
                 continue

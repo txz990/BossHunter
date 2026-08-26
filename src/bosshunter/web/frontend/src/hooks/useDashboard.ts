@@ -106,7 +106,7 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
 
   const fetchAll = async () => {
     try {
-      const needsWorkbench = scope === 'all' || scope === 'workbench'
+      const needsWorkbench = scope === 'all' || scope === 'workbench' || scope === 'monitor'
       const needsJobs = scope === 'all' || scope === 'jobs'
       const needsHistory = scope === 'all' || scope === 'monitor'
       const fetchOptions = { cache: 'no-store' as const }
