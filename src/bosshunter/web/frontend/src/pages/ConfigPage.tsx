@@ -191,7 +191,7 @@ export default function ConfigPage() {
     setPresetError('')
     setPresetMessage('')
     try {
-      const res = await fetch(`/api/ai/presets/${encodeURIComponent(name)}`, { cache: 'no-store' })
+      const res = await fetch(`/api/ai/presets/detail?name=${encodeURIComponent(name)}`, { cache: 'no-store' })
       const data = await res.json()
       if (!res.ok || !data.ok || !data.preset) {
         setPresetError(data.error || '加载 AI 配置失败')
@@ -264,7 +264,7 @@ export default function ConfigPage() {
     setPresetError('')
     setPresetMessage('')
     try {
-      const res = await fetch(`/api/ai/presets/${encodeURIComponent(alias)}`, { method: 'DELETE' })
+      const res = await fetch(`/api/ai/presets/delete?name=${encodeURIComponent(alias)}`, { method: 'DELETE' })
       const data = await res.json()
       if (!res.ok || !data.ok) {
         setPresetError(data.error || '删除失败')

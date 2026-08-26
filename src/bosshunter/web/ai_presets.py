@@ -113,14 +113,31 @@ def list_presets() -> list[dict]:
     return items
 
 
+def _normalize_name(name: str) -> str:
+	"""Best-effort fix for names mangled by WSGI URL decoding on Windows.
+
+	Bottle can hand us a non-ASCII alias whose bytes were double-encoded
+	(e.g. UTF-8 read as Latin-1). Re-encoding Latin-1 back to UTF-8 restores
+	the original Chinese text so the lookup succeeds.
+	"""
+	if not name:
+		return name
+	try:
+		return name.encode("latin-1").decode("utf-8")
+	except (UnicodeEncodeError, UnicodeDecodeError):
+		return name
+
+
 def get_preset(name: str) -> dict | None:
-    """Return a single preset by name (credentials included for direct use)."""
-    with _lock:
-        presets = _load_presets()
-    preset = presets.get(name)
-    if preset is None:
-        return None
-    return {key: value for key, value in preset.items() if key in _PRESET_KEYS}
+	"""Return a single preset by name (credentials included for direct use)."""
+	with _lock:
+		presets = _load_presets()
+	preset = presets.get(name)
+	if preset is None:
+		preset = presets.get(_normalize_name(name))
+	if preset is None:
+		return None
+	return {key: value for key, value in preset.items() if key in _PRESET_KEYS}
 
 
 def _extract_ai_settings(config: dict) -> dict:
@@ -160,14 +177,16 @@ def save_preset(name: str, config: dict) -> dict:
 
 
 def delete_preset(name: str) -> bool:
-    """Delete a preset by name. Returns True if it existed."""
-    with _lock:
-        presets = _load_presets()
-        if name not in presets:
-            return False
-        presets.pop(name)
-        _save_presets(presets)
-    return True
+	"""Delete a preset by name. Returns True if it existed."""
+	with _lock:
+		presets = _load_presets()
+		if name not in presets:
+			name = _normalize_name(name)
+		if name not in presets:
+			return False
+		presets.pop(name)
+		_save_presets(presets)
+	return True
 
 
 def _now_iso() -> str:

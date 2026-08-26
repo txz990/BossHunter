@@ -2164,9 +2164,15 @@ def api_ai_presets_list():
 		return _json_response({"ok": False, "error": str(e)}, 500)
 
 
-@app.route("/api/ai/presets/<name>")
-def api_ai_preset_get(name):
-	"""Return a single preset's full settings so the frontend can apply them."""
+@app.route("/api/ai/presets/detail")
+def api_ai_preset_get():
+	"""Return a single preset's full settings so the frontend can apply them.
+
+	The alias is passed as a query parameter (?name=...) instead of a path
+	segment so that non-ASCII names survive URL decoding reliably across the
+	Bottle/WSGI stack on Windows.
+	"""
+	name = str(request.query.get("name") or "").strip()
 	try:
 		preset = get_preset(name)
 		if preset is None:
@@ -2195,9 +2201,10 @@ def api_ai_presets_save():
 		return _json_response({"ok": False, "error": str(e)}, 500)
 
 
-@app.route("/api/ai/presets/<name>", method="DELETE")
-def api_ai_presets_delete(name):
-	"""Delete a saved preset by alias name."""
+@app.route("/api/ai/presets/delete", method="DELETE")
+def api_ai_presets_delete():
+	"""Delete a saved preset by alias name (passed as ?name= for unicode safety)."""
+	name = str(request.query.get("name") or "").strip()
 	try:
 		deleted = delete_preset(name)
 		if not deleted:
