@@ -2145,6 +2145,16 @@ def run_server(host: str = "127.0.0.1", port: int = 8686, open_browser: bool = T
 		server_class=ThreadingWSGIServer,
 	)
 
+@app.route("/api/ai/models")
+def api_ai_models():
+	"""List models available for the configured AI provider."""
+	try:
+		models = list_ai_models(load_config(CONFIG_PATH))
+		return _json_response({"ok": True, "models": models})
+	except Exception as e:
+		return _json_response({"ok": False, "error": str(e)}, 400)
+
+
 @app.route("/api/ai/presets")
 def api_ai_presets_list():
 	"""List saved AI setting presets (credentials masked)."""
