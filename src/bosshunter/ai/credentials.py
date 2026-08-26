@@ -562,7 +562,7 @@ def call_openai_compatible_text(
     ai_cfg = config.get("ai", {}) if isinstance(config, dict) else {}
     api_key = get_ai_api_key(config)
     base_url = get_ai_base_url(config)
-    model = ai_cfg.get("model") or ""
+    model = get_openai_compatible_model(config)
     if not api_key or not base_url:
         return None
 
@@ -626,6 +626,13 @@ def call_openai_compatible_text(
     if compatibility_error is not None:
         raise normalize_ai_error(compatibility_error) from compatibility_error
     return None
+
+
+def get_openai_compatible_model(config: dict) -> str:
+    """Return the API model ID, normalizing only DeepSeek's case-sensitive IDs."""
+    ai_cfg = config.get("ai", {}) if isinstance(config, dict) else {}
+    model = str(ai_cfg.get("model") or "").strip()
+    return model.lower() if get_ai_service(config) == "deepseek" else model
 
 
 def _match_model_name(requested: str, available: list[str]) -> str | None:

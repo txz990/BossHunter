@@ -3,12 +3,17 @@ import json
 import tempfile
 import time
 import unittest
-from datetime import datetime, timedelta
+from socketserver import ThreadingMixIn
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote
 from unittest.mock import patch
+from wsgiref.simple_server import WSGIServer
 from zipfile import ZipFile
 
 import yaml
+from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from bosshunter.db import (
     add_history,
@@ -52,7 +57,7 @@ class WebApiRouteTests(unittest.TestCase):
         # Cleanup
         server.set_base_dir(self.original_base_dir)
 
-    def _request(self, path: str, method: str = "GET"):
+    def _request(self, path: str, method: str = "GET", json_body: dict | None = None):
         if "?" in path:
             path_info, query_string = path.split("?", 1)
         else:
@@ -64,6 +69,7 @@ class WebApiRouteTests(unittest.TestCase):
             status_headers["status"] = status
             status_headers["headers"] = dict(headers)
 
+        request_body = json.dumps(json_body).encode("utf-8") if json_body is not None else b""
         environ = {
             "REQUEST_METHOD": method,
             "PATH_INFO": path_info,
@@ -72,22 +78,25 @@ class WebApiRouteTests(unittest.TestCase):
             "SERVER_PORT": "8686",
             "wsgi.version": (1, 0),
             "wsgi.url_scheme": "http",
-            "wsgi.input": io.BytesIO(b""),
+            "wsgi.input": io.BytesIO(request_body),
             "wsgi.errors": io.StringIO(),
             "wsgi.multithread": False,
             "wsgi.multiprocess": False,
             "wsgi.run_once": False,
         }
+        if json_body is not None:
+            environ["CONTENT_LENGTH"] = str(len(request_body))
+            environ["CONTENT_TYPE"] = "application/json"
 
-        app_iter = server.app(environ, start_response)
+        response_iter = server.app(environ, start_response)
         try:
             body = b"".join(
                 chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
-                for chunk in app_iter
+                for chunk in response_iter
             ).decode("utf-8")
         finally:
-            close = getattr(app_iter, "close", None)
-            if callable(close):
+            close = getattr(response_iter, "close", None)
+            if close:
                 close()
         return status_headers["status"], status_headers["headers"], body
 
@@ -130,6 +139,17 @@ class WebApiRouteTests(unittest.TestCase):
             for chunk in server.app(environ, start_response)
         ).decode("utf-8")
         return status_headers["status"], status_headers["headers"], response_body
+
+    @patch.object(server.app, "run")
+    def test_run_server_uses_threaded_wsgi_server(self, run):
+        # Act
+        server.run_server(open_browser=False)
+
+        # Assert
+        server_class = run.call_args.kwargs["server_class"]
+        self.assertTrue(issubclass(server_class, ThreadingMixIn))
+        self.assertTrue(issubclass(server_class, WSGIServer))
+        self.assertTrue(server_class.daemon_threads)
 
     def test_web_api_missing_api_route_returns_json_404_not_spa_html(self):
         # Arrange
@@ -321,6 +341,223 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertIn("application/json", headers["Content-Type"])
         self.assertEqual(json.loads(body), [])
 
+    def test_job_search_filters_keyword_score_salary_and_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                matching = _job("matching")
+                matching.update({"title": "实施顾问", "salary": "5-8K", "jd": "负责 SQL 系统实施"})
+                insert_job(db, matching)
+                update_job_score(db, "matching", 82, "数据库技能匹配")
+                update_job_status(db, "matching", "ready")
+
+                wrong_status = _job("wrong-status")
+                wrong_status.update({"title": "实施工程师", "salary": "8-13K", "jd": "需要 SQL"})
+                insert_job(db, wrong_status)
+                update_job_score(db, "wrong-status", 85, "数据库技能匹配")
+                update_job_status(db, "wrong-status", "filtered")
+
+                low_score = _job("low-score")
+                low_score.update({"salary": "10-15K", "jd": "需要 SQL"})
+                insert_job(db, low_score)
+                update_job_score(db, "low-score", 60, "数据库技能匹配")
+                update_job_status(db, "low-score", "ready")
+
+                unrelated = _job("unrelated")
+                unrelated.update({"salary": "10-15K", "jd": "负责客户培训"})
+                insert_job(db, unrelated)
+                update_job_score(db, "unrelated", 88, "沟通能力匹配")
+                update_job_status(db, "unrelated", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, headers, body = self._request(
+                "/api/jobs/search?q=SQL&min_score=71&salary_min=7&salary_max=13&status=ready&limit=15&offset=0"
+            )
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertIn("application/json", headers["Content-Type"])
+        self.assertEqual([job["id"] for job in payload["items"]], ["matching"])
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["all_total"], 4)
+        self.assertEqual(payload["limit"], 15)
+        self.assertEqual(payload["offset"], 0)
+
+    def test_job_search_salary_overlap_excludes_unparseable_and_paginates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                fixtures = [
+                    ("high", "12K", 90),
+                    ("middle", "10-15K", 85),
+                    ("low", "5-8K", 80),
+                    ("daily", "150-200元/天", 95),
+                ]
+                for job_id, salary, score in fixtures:
+                    job = _job(job_id)
+                    job["salary"] = salary
+                    insert_job(db, job)
+                    update_job_score(db, job_id, score, "匹配")
+                    update_job_status(db, job_id, "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/jobs/search?salary_min=7&salary_max=13&limit=2&offset=1"
+            )
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["total"], 3)
+        self.assertEqual([job["id"] for job in payload["items"]], ["middle", "low"])
+
+    def test_job_search_supports_whitelisted_column_sorting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                for job_id, score, education in (("low", 60, "本科"), ("high", 90, "博士")):
+                    job = _job(job_id)
+                    job["education"] = education
+                    insert_job(db, job)
+                    update_job_score(db, job_id, score, "评分")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/jobs/search?sort_by=score&sort_order=asc")
+            invalid_sort_status, _, invalid_sort_body = self._request(
+                "/api/jobs/search?sort_by=score%20DESC&sort_order=asc"
+            )
+            invalid_order_status, _, invalid_order_body = self._request(
+                "/api/jobs/search?sort_by=score&sort_order=sideways"
+            )
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual([job["id"] for job in json.loads(body)["items"]], ["low", "high"])
+        self.assertTrue(invalid_sort_status.startswith("400"), invalid_sort_body)
+        self.assertTrue(invalid_order_status.startswith("400"), invalid_order_body)
+
+    def test_job_search_decodes_chinese_keyword_as_utf8(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                job = _job("chinese-keyword")
+                job["company"] = "网易"
+                insert_job(db, job)
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(f"/api/jobs/search?q={quote('网易')}")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual([job["id"] for job in payload["items"]], ["chinese-keyword"])
+
+    def test_job_search_orders_newest_jobs_before_higher_scored_older_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("older-high-score"))
+                update_job_score(db, "older-high-score", 95, "高分旧岗位")
+                insert_job(db, _job("newer-low-score"))
+                update_job_score(db, "newer-low-score", 60, "低分新岗位")
+                now = datetime.now(UTC).replace(tzinfo=None)
+                db.execute(
+                    "UPDATE jobs SET created_at = ? WHERE id = ?",
+                    ((now - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S"), "older-high-score"),
+                )
+                db.execute(
+                    "UPDATE jobs SET created_at = ? WHERE id = ?",
+                    (now.strftime("%Y-%m-%d %H:%M:%S"), "newer-low-score"),
+                )
+                db.commit()
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/jobs/search")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(
+            [job["id"] for job in payload["items"]],
+            ["newer-low-score", "older-high-score"],
+        )
+
+    def test_job_search_filters_jobs_by_collection_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                now = datetime.now(UTC).replace(tzinfo=None)
+                fixtures = (
+                    ("today", now),
+                    ("recent", now - timedelta(days=2)),
+                    ("older", now - timedelta(days=8)),
+                )
+                for job_id, created_at in fixtures:
+                    insert_job(db, _job(job_id))
+                    db.execute(
+                        "UPDATE jobs SET created_at = ? WHERE id = ?",
+                        (created_at.strftime("%Y-%m-%d %H:%M:%S"), job_id),
+                    )
+                db.commit()
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/jobs/search?created_within=3d")
+            today_status, _, today_body = self._request("/api/jobs/search?created_within=today")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual([job["id"] for job in payload["items"]], ["today", "recent"])
+        self.assertEqual(payload["total"], 2)
+        self.assertEqual(payload["all_total"], 3)
+        today_payload = json.loads(today_body)
+        self.assertTrue(today_status.startswith("200"), today_body)
+        self.assertEqual([job["id"] for job in today_payload["items"]], ["today"])
+
+    def test_job_search_rejects_invalid_numeric_ranges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server.set_base_dir(Path(tmp))
+            paths = [
+                "/api/jobs/search?min_score=not-a-number",
+                "/api/jobs/search?salary_min=14&salary_max=7",
+                "/api/jobs/search?limit=0",
+                "/api/jobs/search?created_within=30d",
+            ]
+
+            for path in paths:
+                status, headers, body = self._request(path)
+                self.assertTrue(status.startswith("400"), body)
+                self.assertIn("application/json", headers["Content-Type"])
+                self.assertIn("error", json.loads(body))
+
+    def test_legacy_jobs_endpoint_still_returns_an_array(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("legacy"))
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/jobs?limit=100")
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertIsInstance(json.loads(body), list)
+
     def test_web_api_workbench_pending_confirmation_returns_ready_jobs(self):
         # Arrange
         with tempfile.TemporaryDirectory() as tmp:
@@ -342,6 +579,106 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertTrue(status.startswith("200"))
         self.assertIn("application/json", headers["Content-Type"])
         self.assertEqual([job["id"] for job in payload["pending_confirmation"]], ["ready-job"])
+
+    def test_workbench_excludes_collection_only_platforms_from_automatic_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                external = _job("zhilian-ready")
+                external.update({"source_platform": "zhilian", "source_job_id": "zhilian-ready"})
+                insert_job(db, external)
+                update_job_score(db, "zhilian-ready", 90, "匹配")
+                update_job_status(db, "zhilian-ready", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/workbench")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["pending_confirmation"], [])
+
+    def test_web_api_workbench_reports_daily_send_quota(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("sent-today"))
+                add_history(db, "sent-today", "sent", "已发送")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/workbench")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["send_quota"], {
+            "daily_limit": 30,
+            "sent": 1,
+            "remaining": 29,
+            "exhausted": False,
+        })
+
+    def test_web_api_workbench_shows_approved_job_when_greeting_was_interrupted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("approved-without-greeting"))
+                update_job_score(db, "approved-without-greeting", 84, "good match")
+                update_job_status(db, "approved-without-greeting", "approved")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/workbench")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(
+            [job["id"] for job in payload["pending_confirmation"]],
+            ["approved-without-greeting"],
+        )
+
+    def test_workbench_returns_today_and_cumulative_funnel_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                # Funnel "today" uses the machine's local calendar day. Keep fixtures
+                # in the same clock so this remains stable around local midnight.
+                now = datetime.now()
+                fixtures = (
+                    ("today-ready", "ready", now),
+                    ("today-sent", "sent", now - timedelta(hours=1)),
+                    ("older-sent", "sent", now - timedelta(days=2)),
+                )
+                for job_id, job_status, created_at in fixtures:
+                    insert_job(db, _job(job_id))
+                    update_job_score(db, job_id, 80, "匹配")
+                    update_job_status(db, job_id, job_status)
+                    db.execute(
+                        "UPDATE jobs SET created_at = ? WHERE id = ?",
+                        (created_at.strftime("%Y-%m-%d %H:%M:%S"), job_id),
+                    )
+                db.commit()
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/workbench")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["funnel"]["采集总数"], 3)
+        self.assertEqual(payload["funnel"]["发送"], 2)
+        self.assertEqual(payload["funnel_today"]["采集总数"], 2)
+        self.assertEqual(payload["funnel_today"]["AI评分"], 2)
+        self.assertEqual(payload["funnel_today"]["发送"], 1)
+        self.assertEqual(len(payload["pending_confirmation"]), 1)
 
     def test_web_api_full_task_stays_running_while_waiting_for_frontend_confirmation(self):
         # Arrange
@@ -424,21 +761,29 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(status_after_stop["active"]["status"], "stopping")
         self.assertEqual(second_task["mode"], "monitor")
 
-    def test_task_runner_stop_wakes_monitor_interval_wait(self):
+    def test_task_stop_wakes_monitor_interval_wait(self):
         # Arrange
-        wakeup_event = Event()
-        task = WorkbenchTask(id="monitor-task", mode="monitor", label="单独监测")
-        task.context["monitor_wakeup_event"] = wakeup_event
-        runner = WorkbenchTaskRunner()
-        runner._tasks[task.id] = task
+        waiting = Event()
+        release = Event()
+
+        def monitor_executor(task, config):
+            task.context["monitor_wakeup_event"] = release
+            waiting.set()
+            release.wait(timeout=1)
+
+        runner = WorkbenchTaskRunner({"monitor": monitor_executor})
+        task = runner.start("monitor", {})
+        self.assertTrue(waiting.wait(timeout=1))
 
         # Act
-        stopped = runner.stop(task.id)
+        runner.stop(task["id"])
+        runner.wait(timeout=0.5)
+        result = runner.status()["last_task"]
 
         # Assert
-        self.assertEqual(stopped["status"], "stopping")
-        self.assertTrue(stopped["stop_requested"])
-        self.assertTrue(wakeup_event.is_set())
+        self.assertTrue(release.is_set())
+        self.assertEqual(result["status"], "stopped")
+        self.assertIsNone(runner.status()["active"])
 
     def test_task_runner_automatically_stops_at_send_window_deadline(self):
         # Arrange
@@ -566,6 +911,122 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(full_task.context["confirmed_job_ids"], ["ready-job"])
         self.assertEqual(json.loads(response_body)["id"], "full-task")
 
+    def test_web_api_manual_sent_records_external_send_without_using_boss_quota(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                external = _job("51job-manual")
+                external.update({"source_platform": "51job", "source_job_id": "51job-manual"})
+                insert_job(db, external)
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/jobs/manual-sent",
+                method="POST",
+                json_body={"job_ids": ["51job-manual"], "confirmed": True},
+            )
+            workbench_status, _, workbench_body = self._request("/api/workbench")
+            verify_db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                row = verify_db.execute(
+                    "SELECT status FROM jobs WHERE id = ?",
+                    ("51job-manual",),
+                ).fetchone()
+                history = verify_db.execute(
+                    "SELECT action FROM history WHERE job_id = ?",
+                    ("51job-manual",),
+                ).fetchall()
+            finally:
+                verify_db.close()
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(json.loads(body)["affected_count"], 1)
+        self.assertTrue(workbench_status.startswith("200"), workbench_body)
+        self.assertEqual(json.loads(workbench_body)["send_quota"]["sent"], 0)
+        self.assertEqual(row["status"], "sent")
+        self.assertEqual([item["action"] for item in history], ["manual_sent"])
+
+    def test_web_api_deliver_rejects_already_sent_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("already-sent"))
+                update_job_greeting(db, "already-sent", "已经发送过的招呼语")
+                update_job_status(db, "already-sent", "sent")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/workbench/deliver",
+                method="POST",
+                json_body={"job_ids": ["already-sent"]},
+            )
+
+        self.assertTrue(status.startswith("409"), body)
+        self.assertEqual(json.loads(body)["invalid_ids"], ["already-sent"])
+
+    def test_web_api_direct_send_requires_a_retryable_greeting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("error-without-greeting"))
+                update_job_status(db, "error-without-greeting", "error")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/workbench/deliver",
+                method="POST",
+                json_body={"job_ids": ["error-without-greeting"], "direct_send": True},
+            )
+
+        self.assertTrue(status.startswith("409"), body)
+        self.assertEqual(json.loads(body)["invalid_ids"], ["error-without-greeting"])
+
+    def test_web_api_deliver_queues_confirmation_before_full_task_event_exists(self):
+        full_task = WorkbenchTask(id="full-before-event", mode="full", label="运行全流程")
+        runner = WorkbenchTaskRunner()
+        runner._tasks[full_task.id] = full_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("ready-job"))
+                update_job_status(db, "ready-job", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/workbench/deliver",
+                    method="POST",
+                    json_body={"job_ids": ["ready-job"]},
+                )
+
+            verify_db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                job_status = verify_db.execute(
+                    "SELECT status FROM jobs WHERE id = ?",
+                    ("ready-job",),
+                ).fetchone()["status"]
+            finally:
+                verify_db.close()
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(json.loads(body)["id"], "full-before-event")
+        self.assertEqual(full_task.context["confirmed_job_ids"], ["ready-job"])
+        self.assertTrue(full_task.context["delivery_requested"])
+        self.assertEqual(job_status, "approved")
+
     def test_web_api_deliver_queues_jobs_while_full_task_is_monitoring(self):
         # Arrange
         wakeup_event = Event()
@@ -638,6 +1099,61 @@ class WebApiRouteTests(unittest.TestCase):
             full_task.context["pending_deliveries"],
             [{"job_ids": ["ready-job"], "direct_send": False}],
         )
+
+    def test_web_api_deliver_reuses_active_delivery_queue_instead_of_conflict(self):
+        active_task = WorkbenchTask(id="active-delivery", mode="deliver", label="确认投递")
+        active_task.context.update({
+            "delivering": True,
+            "delivery_queue_lock": Lock(),
+            "delivery_scheduled_ids": {"already-scheduled"},
+            "pending_deliveries": [],
+        })
+        runner = WorkbenchTaskRunner()
+        runner._tasks[active_task.id] = active_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                for job_id in ("already-scheduled", "new-ready"):
+                    insert_job(db, _job(job_id))
+                    update_job_status(db, job_id, "ready")
+                    update_job_greeting(db, job_id, f"{job_id} 的待发送招呼语")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/workbench/deliver",
+                    method="POST",
+                    json_body={"job_ids": ["already-scheduled", "new-ready"], "direct_send": True},
+                )
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["id"], "active-delivery")
+        self.assertEqual(payload["queued_count"], 1)
+        self.assertEqual(payload["already_queued_count"], 1)
+        self.assertEqual(
+            active_task.context["pending_deliveries"],
+            [{"job_ids": ["new-ready"], "direct_send": True}],
+        )
+
+    def test_execute_deliver_drains_batches_added_to_active_queue(self):
+        task = WorkbenchTask(id="delivery-task", mode="deliver", label="确认投递")
+        task.context["pending_deliveries"] = [
+            {"job_ids": ["queued-job"], "direct_send": True}
+        ]
+        config = {"_workbench_job_ids": ["initial-job"], "throttle": {}}
+
+        with patch.object(server, "_execute_deliver_batch") as execute_batch:
+            server._execute_deliver(task, config)
+
+        self.assertEqual(execute_batch.call_count, 2)
+        self.assertEqual(execute_batch.call_args_list[0].args[1]["_workbench_job_ids"], ["initial-job"])
+        self.assertEqual(execute_batch.call_args_list[1].args[1]["_workbench_job_ids"], ["queued-job"])
+        self.assertTrue(execute_batch.call_args_list[1].args[1]["_workbench_skip_greeting"])
 
     def test_monitor_loop_processes_queued_delivery_before_next_check(self):
         # Arrange
@@ -734,6 +1250,45 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(active_task.context["confirmed_job_ids"], ["ready-job"])
         self.assertEqual(json.loads(response_body)["id"], "active-full-task")
 
+    def test_web_api_deliver_conflict_does_not_change_job_or_history(self):
+        active_task = WorkbenchTask(id="active-delivery", mode="deliver", label="确认投递")
+        runner = WorkbenchTaskRunner()
+        runner._tasks[active_task.id] = active_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("ready-job"))
+                update_job_status(db, "ready-job", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "task_runner", runner):
+                response_status, _, response_body = self._request(
+                    "/api/workbench/deliver",
+                    method="POST",
+                    json_body={"job_ids": ["ready-job"]},
+                )
+
+            verify_db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                job_status = verify_db.execute(
+                    "SELECT status FROM jobs WHERE id = ?",
+                    ("ready-job",),
+                ).fetchone()["status"]
+                approved_history = verify_db.execute(
+                    "SELECT COUNT(*) FROM history WHERE job_id = ? AND action = ?",
+                    ("ready-job", "approved"),
+                ).fetchone()[0]
+            finally:
+                verify_db.close()
+
+        self.assertTrue(response_status.startswith("409"), response_body)
+        self.assertEqual(job_status, "ready")
+        self.assertEqual(approved_history, 0)
+
     def test_web_api_full_task_continues_delivery_and_monitoring_after_confirmation(self):
         # Arrange
         calls = []
@@ -748,7 +1303,7 @@ class WebApiRouteTests(unittest.TestCase):
                 config.get("throttle", {}).get("daily_limit"),
             ))
 
-        def fake_monitor(task, config):
+        def fake_monitor(task, config, **kwargs):
             calls.append("monitor")
 
         runner = WorkbenchTaskRunner()
@@ -786,6 +1341,39 @@ class WebApiRouteTests(unittest.TestCase):
             calls,
             ["collect", ("deliver", ["ready-a", "ready-b"], 40), "monitor"],
         )
+
+    def test_full_task_consumes_confirmation_queued_before_event_creation(self):
+        calls = []
+        task = WorkbenchTask(id="queued-before-event", mode="full", label="运行全流程")
+        task.context.update({
+            "confirmed_job_ids": ["approved-a"],
+            "delivery_requested": True,
+        })
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("approved-a"))
+                update_job_score(db, "approved-a", 88, "good match")
+                update_job_status(db, "approved-a", "approved")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "_execute_collect", side_effect=lambda *_: calls.append("collect")), \
+                 patch.object(
+                     server,
+                     "_execute_deliver",
+                     side_effect=lambda _task, config: calls.append(("deliver", config["_workbench_job_ids"])),
+                 ), \
+                 patch.object(server, "_execute_monitor", side_effect=lambda *_, **__: calls.append("monitor")), \
+                 patch.object(server, "load_config", return_value={}):
+                server._execute_full(task, {})
+
+        self.assertEqual(calls, ["collect", ("deliver", ["approved-a"]), "monitor"])
+        self.assertFalse(task.context["waiting_confirmation"])
+        self.assertTrue(task.context["confirmation_complete"])
 
     def test_full_task_sends_previous_confirmed_backlog_before_collecting(self):
         # Arrange
@@ -851,6 +1439,9 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertIn("招呼语发送结果：成功 1，失败 1，待下次发送 1（共 3）", task.logs)
         self.assertIn("1 个岗位发送失败已单独记录，继续后续流程", task.logs)
         self.assertIn("1 个岗位因今日发送额度未执行，已保留在“待发送招呼语”", task.logs)
+        self.assertEqual(task.stop_reason, "daily_limit")
+        self.assertEqual(task.metrics["send_success"], 1)
+        self.assertEqual(task.metrics["send_deferred"], 1)
 
     def test_deliver_still_stops_on_account_risk_signal(self):
         # Arrange
@@ -1082,6 +1673,78 @@ class WebApiRouteTests(unittest.TestCase):
             self.assertIn("# 李雷", stored_content)
             self.assertIn("- 5 年产品经验", stored_content)
 
+    def test_web_api_resume_upload_extracts_text_layer_from_pdf(self):
+        writer = PdfWriter()
+        page = writer.add_blank_page(width=612, height=792)
+        font = DictionaryObject({
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        })
+        page[NameObject("/Resources")] = DictionaryObject({
+            NameObject("/Font"): DictionaryObject({NameObject("/F1"): font}),
+        })
+        contents = DecodedStreamObject()
+        contents.set_data(b"BT /F1 12 Tf 72 720 Td (Jane Resume - Product Manager) Tj ET")
+        page[NameObject("/Contents")] = contents
+        pdf = io.BytesIO()
+        writer.write(pdf)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._upload_resume("resume.pdf", pdf.getvalue(), "application/pdf")
+            payload = json.loads(body)
+            stored_path = Path(payload["path"])
+            stored_text = stored_path.read_text(encoding="utf-8")
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["filename"], "resume.md")
+        self.assertIn("Jane Resume - Product Manager", stored_text)
+
+    def test_web_api_resume_upload_rejects_encrypted_pdf(self):
+        writer = PdfWriter()
+        writer.add_blank_page(width=612, height=792)
+        writer.encrypt("secret")
+        pdf = io.BytesIO()
+        writer.write(pdf)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+            server.set_base_dir(base_dir)
+            status, _, body = self._upload_resume("encrypted.pdf", pdf.getvalue(), "application/pdf")
+
+        self.assertTrue(status.startswith("400"), body)
+        self.assertEqual(json.loads(body), {"error": "PDF 已加密，请上传未加密的简历"})
+
+    def test_web_api_resume_upload_rejects_damaged_pdf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+            server.set_base_dir(base_dir)
+            status, _, body = self._upload_resume("damaged.pdf", b"%PDF-1.7\nbroken", "application/pdf")
+
+        self.assertTrue(status.startswith("400"), body)
+        self.assertEqual(json.loads(body), {"error": "PDF 文件无效或已损坏"})
+
+    def test_web_api_resume_upload_rejects_scanned_pdf_without_text_layer(self):
+        writer = PdfWriter()
+        writer.add_blank_page(width=612, height=792)
+        pdf = io.BytesIO()
+        writer.write(pdf)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+            server.set_base_dir(base_dir)
+            status, _, body = self._upload_resume("scanned.pdf", pdf.getvalue(), "application/pdf")
+
+        self.assertTrue(status.startswith("400"), body)
+        self.assertIn("扫描版或无文字层", json.loads(body)["error"])
+
     def test_web_api_resume_upload_rejects_legacy_doc_format(self):
         # Arrange
         with tempfile.TemporaryDirectory() as tmp:
@@ -1094,7 +1757,7 @@ class WebApiRouteTests(unittest.TestCase):
 
             # Assert
             self.assertTrue(status.startswith("400"), body)
-            self.assertEqual(json.loads(body), {"error": "仅支持 .md 或 .docx 格式"})
+            self.assertEqual(json.loads(body), {"error": "仅支持 .md、.docx 或 .pdf 格式"})
 
     def test_web_api_history_dismiss_reply_adds_dismissed_history_without_rejecting_job(self):
         # Arrange
@@ -1343,6 +2006,86 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertFalse(unresolved_item["resolved"])
         self.assertTrue(resolved_item["resolved"])
         self.assertEqual(resolved_item["resume_path"], "/tmp/generated.md")
+
+    def test_full_task_receives_global_boss_collection_options(self):
+        config = {
+            "search": {"keywords": ["旧关键词"], "cities": ["北京"]},
+            "profile": {"target_cities": ["北京"]},
+            "collection": {"default_order": ["boss"]},
+            "platforms": {
+                "boss": {"enabled": True, "search": {"keywords": ["全局关键词"], "cities": ["上海"], "max_pages": 2, "sort": "newest", "target_count": 4}},
+                "zhilian": {"enabled": False, "search": {}},
+            },
+        }
+        with patch.object(server, "load_config", return_value=config), patch.object(server, "_preflight_messages", return_value=[]), patch.object(
+            server, "_write_config"
+        ), patch.object(server.task_runner, "start", return_value={"id": "full-global-config"}) as start:
+            status, _, body = self._request("/api/workbench/task", method="POST", json_body={"mode": "full"})
+
+        self.assertTrue(status.startswith("200"), body)
+        task_config = start.call_args.args[1]
+        self.assertEqual(task_config["_collection_options"]["platforms"]["boss"]["keywords"], ["全局关键词"])
+        self.assertEqual(task_config["_collection_options"]["platforms"]["boss"]["cities"], ["上海"])
+        self.assertNotIn("target_count", task_config["_collection_options"]["platforms"]["boss"])
+        self.assertTrue(task_config["_collection_options"]["auto_score"])
+
+    def test_full_task_rejects_collection_only_platform_from_saved_config(self):
+        config = {
+            "search": {"keywords": ["人力"], "cities": ["深圳"]},
+            "profile": {"resume_path": "C:/resume.md"},
+            "ai": {"api_key": "test-key"},
+            "collection": {"default_order": ["boss", "zhilian"]},
+            "platforms": {
+                "boss": {"enabled": True, "search": {"keywords": ["人力"], "cities": ["深圳"]}},
+                "zhilian": {"enabled": True, "search": {"keywords": ["人力"], "cities": ["深圳"]}},
+            },
+        }
+        with patch.object(server, "load_config", return_value=config), patch.object(server, "_preflight_messages", return_value=[]), patch.object(
+            server.task_runner, "start", return_value={"id": "full-with-zhilian"}
+        ) as start:
+            status, _, body = self._request("/api/workbench/task", method="POST", json_body={"mode": "full"})
+
+        self.assertTrue(status.startswith("400"), body)
+        self.assertEqual(json.loads(body)["collection_only_platforms"], ["zhilian"])
+        start.assert_not_called()
+
+    def test_full_task_rejects_collection_only_platform_from_dialog(self):
+        config = {
+            "profile": {"resume_path": "C:/resume.md"},
+            "ai": {"api_key": "test-key"},
+            "collection": {"default_order": ["boss"]},
+            "platforms": {
+                "boss": {"enabled": True, "search": {}},
+                "zhilian": {"enabled": False, "search": {}},
+            },
+        }
+        options = {
+            "platform_order": ["zhilian"],
+            "auto_score": False,
+            "platforms": {
+                "zhilian": {
+                    "keywords": ["人力"],
+                    "cities": ["深圳"],
+                    "city_codes": {"深圳": "765"},
+                    "max_pages": 3,
+                    "sort": "default",
+                    "target_count": 3,
+                },
+            },
+        }
+        with patch.object(server, "load_config", return_value=config), patch.object(server, "_preflight_messages", return_value=[]), patch.object(
+            server, "_write_config"
+        ) as write_config, patch.object(server.task_runner, "start", return_value={"id": "full-dialog-options"}) as start:
+            status, _, body = self._request(
+                "/api/workbench/task",
+                method="POST",
+                json_body={"mode": "full", "options": options},
+            )
+
+        self.assertTrue(status.startswith("400"), body)
+        self.assertEqual(json.loads(body)["collection_only_platforms"], ["zhilian"])
+        start.assert_not_called()
+        write_config.assert_not_called()
 
 
 if __name__ == "__main__":

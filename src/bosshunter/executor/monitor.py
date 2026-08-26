@@ -15,16 +15,57 @@ from bosshunter.cancellation import (
 )
 from bosshunter.db import (
     get_db, get_jobs_by_status,
-    update_job_status, add_history,
+    update_job_status, add_history, add_risk_event, set_platform_safety_lock,
 )
 from bosshunter.throttle import RequestThrottle, SendWindowChecker
+from bosshunter.platform_safety import (
+    PlatformAccessGuard,
+    PlatformSafetyStop,
+    TransientPlatformAccessGuard,
+)
 
 console = Console()
 
 PORTFOLIO_URL = None  # Set via config: profile.portfolio_url
 
+
+def get_boss_operation_interval_multiplier(config: dict) -> float:
+    """Return the bounded BOSS page-operation interval multiplier."""
+    raw_value = config.get("collection", {}).get("collection_delay_multiplier", 1.5)
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        value = 1.5
+    return min(max(value, 1.0), 5.0)
+
+
+def _positive_interval_seconds(value: object, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(parsed, 1.0)
+
+
+def get_effective_monitor_interval_minutes(
+    config: dict,
+    base_interval_minutes: float | int | None = None,
+) -> float:
+    """Apply the BOSS operation multiplier to the wait between monitor cycles."""
+    raw_interval = (
+        base_interval_minutes
+        if base_interval_minutes is not None
+        else config.get("monitor", {}).get("interval", 30)
+    )
+    try:
+        interval = float(raw_interval)
+    except (TypeError, ValueError):
+        interval = 30.0
+    return max(interval, 1.0) * get_boss_operation_interval_multiplier(config)
+
+
 # JS: Extract chat list with full message context
-JS_EXTRACT_CHAT_LIST = """
+JS_EXTRACT_CHAT_LIST = r"""
 (() => {
     const items = document.querySelectorAll('li[role=listitem]');
     const results = [];
@@ -33,6 +74,7 @@ JS_EXTRACT_CHAT_LIST = """
         const nameBox = item.querySelector('.name-box');
         const lastMsgEl = item.querySelector('.last-msg-text');
         const msgStatus = item.querySelector('.message-status');
+        const unreadEl = item.querySelector('.unread-count, .badge-count, .notice-badge, [class*="unread"]');
 
         if (!nameText) return;
 
@@ -40,24 +82,86 @@ JS_EXTRACT_CHAT_LIST = """
         const company = spans.length >= 2 ? spans[1].textContent.trim() : '';
         const hrTitle = spans.length >= 3 ? spans[spans.length - 1].textContent.trim() : '';
 
-        // Determine if HR replied: no message-status means the last message is FROM HR
+        // A missing delivery marker is not enough to prove the message came from HR.
+        // Treat uncertain rows as candidates and verify direction from the full chat.
         const statusClass = msgStatus ? msgStatus.className : '';
-        const isOurMessage = statusClass.includes('status-read') || statusClass.includes('status-delivery');
-        const hasReply = !!lastMsgEl && !isOurMessage;
+        const lastMsgClass = lastMsgEl ? String(lastMsgEl.className || '').toLowerCase() : '';
+        const lastMessage = lastMsgEl ? lastMsgEl.textContent.trim().substring(0, 200) : '';
+        const isOurMessage = statusClass.includes('status-read')
+            || statusClass.includes('status-delivery')
+            || /(myself|self|mine|outgoing|send)/.test(lastMsgClass);
+        const isHrMessage = /(friend|other|incoming|receive)/.test(lastMsgClass);
+        const isSystemMessage = /正在与Boss.+沟通|近30天过滤了.+BOSS发来的消息|你与该职位竞争者PK情况|新岗位速递|VIP数据总结|根据你的历史开聊\/收藏岗位|根据你的开聊\/收藏岗位.+为你推荐\d+个新岗位|识别到以下新发布岗位你可能感兴趣|我是你的求职助手|感谢您使用VIP权益|(?:您的|VIP)权益已到期|点击续费vip|牛人vip怎么样|附件简历请求已发送|附件简历已发送给对方|附件简历.{0,80}已发送给Boss/i.test(lastMessage);
+        const lastDirection = isOurMessage ? 'me' : (isHrMessage ? 'hr' : 'unknown');
+        const hasReply = !!lastMsgEl && lastDirection !== 'me' && !isSystemMessage;
 
         results.push({
             hr_name: nameText.textContent.trim(),
             company: company,
             hr_title: hrTitle,
-            last_message: lastMsgEl ? lastMsgEl.textContent.trim().substring(0, 200) : '',
+            last_message: lastMessage,
             has_reply: hasReply,
+            has_unread: !!unreadEl,
             is_our_message: isOurMessage,
+            last_direction: lastDirection,
             element_index: results.length
         });
     });
     return JSON.stringify(results);
 })()
 """
+
+JS_DETECT_MONITOR_RISK = """
+(() => {
+    const text = document.body ? document.body.innerText : '';
+    const title = document.title || '';
+    const url = window.location.href || '';
+    const hasCaptchaElement = !!document.querySelector(
+        '.geetest_panel, .captcha, [class*="captcha"], [id*="captcha"], iframe[src*="captcha"], iframe[src*="verify"]'
+    );
+    if (
+        hasCaptchaElement || /captcha|verify|security-check/i.test(url) ||
+        ['请完成验证', '安全验证', '拖动滑块', '点击完成验证'].some(value => text.includes(value))
+    ) return JSON.stringify({risk: 'captcha'});
+    if (
+        ['操作过于频繁', '访问过于频繁', '请求过于频繁', '操作频繁，请稍后再试'].some(value => text.includes(value))
+    ) return JSON.stringify({risk: 'rate_limit'});
+    if (
+        ['账号存在异常', '账号已被限制', '当前账号异常', '访问被拒绝', '账号或请求被拦截'].some(value => text.includes(value)) ||
+        ['账号异常', '访问受限'].some(value => title.includes(value))
+    ) return JSON.stringify({risk: 'blocked'});
+    return JSON.stringify({risk: null});
+})()
+"""
+
+
+class MonitorRiskDetected(RuntimeError):
+    """Raised when monitoring must stop immediately for account safety."""
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
+
+
+class MonitorSafetyGuard:
+    """Track consecutive monitor page failures and stop at a conservative threshold."""
+
+    def __init__(self, config: dict) -> None:
+        self.config = config
+        raw_limit = config.get("monitor", {}).get("max_consecutive_page_failures", 3)
+        try:
+            self.limit = max(int(raw_limit), 1)
+        except (TypeError, ValueError):
+            self.limit = 3
+        self.consecutive_page_failures = 0
+
+    def record_page_failure(self) -> None:
+        self.consecutive_page_failures += 1
+        if self.consecutive_page_failures >= self.limit:
+            _raise_monitor_risk("consecutive_page_failures", self.config)
+
+    def record_page_success(self) -> None:
+        self.consecutive_page_failures = 0
 
 # JS: Extract full conversation messages from an open chat, including rich/system cards
 JS_EXTRACT_CONVERSATION = r"""
@@ -125,15 +229,30 @@ JS_EXTRACT_CONVERSATION = r"""
         return hasAttachmentResume && hasIntent;
     }
 
+    function senderOf(msg, text) {
+        if (/正在与Boss.+沟通|近30天过滤了.+BOSS发来的消息|你与该职位竞争者PK情况|新岗位速递|VIP数据总结|根据你的历史开聊\/收藏岗位|根据你的开聊\/收藏岗位.+为你推荐\d+个新岗位|识别到以下新发布岗位你可能感兴趣|我是你的求职助手|感谢您使用VIP权益|(?:您的|VIP)权益已到期|点击续费vip|牛人vip怎么样|附件简历请求已发送|附件简历已发送给对方|附件简历.{0,80}已发送给Boss/i.test(text)) {
+            return 'system';
+        }
+
+        const classNames = [msg, ...msg.querySelectorAll('[class]')]
+            .map(el => String(el.className || '').toLowerCase())
+            .join(' ');
+        if (/(^|\s|[-_])(item-myself|message-self|msg-self|is-self|my-message|message-mine|from-me|outgoing)(\s|$|[-_])/.test(classNames)) {
+            return 'me';
+        }
+        if (/(^|\s|[-_])(item-friend|message-other|message-receive|from-other|incoming)(\s|$|[-_])/.test(classNames)) {
+            return 'hr';
+        }
+        return 'unknown';
+    }
+
     const msgs = document.querySelectorAll(MESSAGE_SELECTORS);
     const results = [];
     msgs.forEach(msg => {
-        const isMe = msg.classList.contains('is-self') || msg.classList.contains('message-self')
-            || msg.querySelector('.msg-self') !== null;
         const text = collectVisibleText(msg);
         if (text) {
             results.push({
-                sender: isMe ? 'me' : 'hr',
+                sender: senderOf(msg, text),
                 text: text.substring(0, 500),
                 kind: isResumeRequestCard(text) ? 'resume_request_card' : 'message'
             });
@@ -212,6 +331,87 @@ def _wait_for_page_or_stop(target_id: str, config: dict, timeout: float = 10) ->
     except OperationCancelled:
         return False
     return not stop_requested(config)
+
+
+def _monitor_safety_guard(config: dict) -> MonitorSafetyGuard:
+    guard = config.get("_monitor_safety_guard")
+    if isinstance(guard, MonitorSafetyGuard):
+        return guard
+    guard = MonitorSafetyGuard(config)
+    config["_monitor_safety_guard"] = guard
+    return guard
+
+
+def _record_page_failure_unless_stopped(config: dict) -> None:
+    if not stop_requested(config):
+        _monitor_safety_guard(config).record_page_failure()
+
+
+def _record_monitor_risk(kind: str, config: dict | None = None) -> None:
+    """Persist a safe risk event without page text, URLs, or account data."""
+    labels = {
+        "captcha": "监测检测到验证码，已停止",
+        "rate_limit": "监测检测到频率限制，已停止",
+        "blocked": "监测检测到账号或请求拦截，已停止",
+        "consecutive_page_failures": "监测连续页面失败达到阈值，已停止",
+    }
+    db = None
+    try:
+        db = get_db()
+        add_risk_event(db, f"monitor_{kind}", labels.get(kind, "监测检测到风险信号，已停止"))
+        raw_minutes = (config or {}).get("safety", {}).get("risk_lock_minutes", 10)
+        try:
+            lock_minutes = max(int(raw_minutes), 1)
+        except (TypeError, ValueError):
+            lock_minutes = 10
+        set_platform_safety_lock(db, kind, minutes=lock_minutes)
+    except Exception:
+        # Failure to persist telemetry must never allow risky browsing to continue.
+        pass
+    finally:
+        if db is not None:
+            db.close()
+
+
+def _raise_monitor_risk(kind: str, config: dict | None = None) -> None:
+    _record_monitor_risk(kind, config)
+    raise MonitorRiskDetected(kind)
+
+
+def _inspect_monitor_page(target_id: str, config: dict) -> None:
+    """Stop immediately when the current platform page exposes a risk signal."""
+    raw = evaluate(target_id, JS_DETECT_MONITOR_RISK)
+    try:
+        result = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return
+    if not isinstance(result, dict):
+        return
+    kind = result.get("risk")
+    if kind in {"captcha", "rate_limit", "blocked"}:
+        _raise_monitor_risk(kind, config)
+
+
+def _open_monitor_tab(url: str, config: dict) -> str | None:
+    """Open one monitor page with an effective interval after every prior open attempt."""
+    if stop_requested(config):
+        return None
+    throttle = config.get("_monitor_request_throttle")
+    stop_event = get_stop_event(config)
+    if throttle is not None and bool(getattr(throttle, "has_marked_request", False)):
+        if throttle.wait(stop_event):
+            return None
+    access_guard = config.get("_platform_access_guard")
+    if isinstance(access_guard, (PlatformAccessGuard, TransientPlatformAccessGuard)):
+        try:
+            access_guard.reserve("monitor_page")
+        except PlatformSafetyStop as exc:
+            raise MonitorRiskDetected(exc.reason) from exc
+    target_id = new_tab(url, background=True)
+    if throttle is not None and hasattr(throttle, "mark"):
+        # Record attempts as well as successful opens so retries cannot become a burst.
+        throttle.mark()
+    return target_id
 
 
 def _detect_rejection(messages: list[dict]) -> bool:
@@ -318,13 +518,91 @@ def _get_hr_messages_after_last_reply(messages: list[dict]) -> list[dict]:
     return [m for m in after if m["sender"] == "hr"]
 
 
+def _normalized_message_text(text: str) -> str:
+    """Normalize chat text for conservative sender reconciliation."""
+    return " ".join(str(text or "").split())
+
+
+def _looks_like_system_message(text: str) -> bool:
+    """Identify BOSS UI notices that are not participant messages."""
+    normalized = _normalized_message_text(text)
+    normalized_lower = normalized.lower()
+    system_markers = (
+        "您正在与Boss",
+        "近30天过滤了",
+        "你与该职位竞争者PK情况",
+        "新岗位速递",
+        "VIP数据总结",
+        "根据你的历史开聊/收藏岗位",
+        "识别到以下新发布岗位你可能感兴趣",
+    )
+    assistant_markers = (
+        "我是你的求职助手",
+        "感谢您使用vip权益",
+        "您的权益已到期",
+        "vip权益已到期",
+        "点击续费vip",
+        "牛人vip怎么样",
+        "附件简历请求已发送",
+        "附件简历已发送给对方",
+    )
+    return (
+        any(marker in normalized for marker in system_markers)
+        or any(marker in normalized_lower for marker in assistant_markers)
+        or ("附件简历" in normalized and "已发送给Boss" in normalized)
+    )
+
+
+def _matches_own_greeting(message_text: str, greeting: str) -> bool:
+    """Return true when a chat bubble contains this job's saved greeting."""
+    message = _normalized_message_text(message_text)
+    expected = _normalized_message_text(greeting)
+    if len(expected) < 8 or not message:
+        return False
+    if expected in message:
+        return True
+    prefix_length = min(len(expected), 48)
+    return prefix_length >= 24 and expected[:prefix_length] in message
+
+
+def _reconcile_conversation_messages(messages: list[dict], job: dict) -> list[dict]:
+    """Correct known own/system messages without guessing unknown as HR."""
+    greeting = str(job.get("greeting") or "")
+    reconciled = []
+    for raw_message in messages:
+        message = dict(raw_message) if isinstance(raw_message, dict) else {}
+        text = str(message.get("text") or "")
+        sender = str(message.get("sender") or "unknown")
+        strong_resume_request = (
+            message.get("kind") == "resume_request_card"
+            or _looks_like_resume_request_card(text)
+        )
+        if _looks_like_system_message(text) and not strong_resume_request:
+            sender = "system"
+        elif _matches_own_greeting(text, greeting):
+            sender = "me"
+        elif strong_resume_request and sender in {"unknown", "system"}:
+            sender = "hr"
+        elif sender not in {"me", "hr", "system"}:
+            sender = "unknown"
+        message["sender"] = sender
+        message["text"] = text
+        reconciled.append(message)
+    return reconciled
+
+
 def _truncate_text(text: str, limit: int) -> str:
     """Limit text length for history payloads."""
     text = text or ""
     return text if len(text) <= limit else text[:limit]
 
 
-def _build_reply_detail(messages: list[dict], ai_reply: str, schema: str = "reply_pending.v1") -> str:
+def _build_reply_detail(
+    messages: list[dict],
+    ai_reply: str,
+    schema: str = "reply_pending.v1",
+    conversation: dict | None = None,
+) -> str:
     """Build structured history detail containing the HR question and AI reply."""
     hr_messages = _get_hr_messages_after_last_reply(messages)
     hr_question = "\n".join(str(msg.get("text", "")) for msg in hr_messages[-3:]).strip()
@@ -333,6 +611,9 @@ def _build_reply_detail(messages: list[dict], ai_reply: str, schema: str = "repl
         "schema": schema,
         "hr_question": _truncate_text(hr_question, 1000),
         "reply_fingerprint": reply_fingerprint,
+        "chat_list_last_message": _reply_fingerprint_from_hr_question(
+            str((conversation or {}).get("last_message", ""))
+        ),
         "ai_reply": _truncate_text(ai_reply or "", 1000),
         "conversation_tail": [
             {
@@ -384,6 +665,12 @@ def _reply_fingerprint_from_detail(detail: str) -> str:
         return _reply_fingerprint_from_hr_question(fingerprint)
     hr_question = payload.get("hr_question") or payload.get("pending_hr_question")
     return _reply_fingerprint_from_hr_question(hr_question) if isinstance(hr_question, str) else ""
+
+
+def _chat_list_fingerprint_from_detail(detail: str) -> str:
+    payload = _parse_reply_detail(detail)
+    value = payload.get("chat_list_last_message")
+    return _reply_fingerprint_from_hr_question(value) if isinstance(value, str) else ""
 
 
 def _build_reply_resolution_detail(
@@ -510,8 +797,9 @@ def _open_conversation(job: dict, config: dict) -> str | None:
     # Strategy A: Via job URL (try up to 2 times)
     if job_url:
         for attempt in range(2):
-            target_id = new_tab(job_url, background=True)
+            target_id = _open_monitor_tab(job_url, config)
             if not target_id:
+                _record_page_failure_unless_stopped(config)
                 if attempt == 0:
                     if _wait_or_stop(config, 3):
                         return None
@@ -520,7 +808,13 @@ def _open_conversation(job: dict, config: dict) -> str | None:
 
             if _wait_or_stop(config, 3) or not _wait_for_page_or_stop(target_id, config, timeout=10):
                 close_tab(target_id)
+                _record_page_failure_unless_stopped(config)
                 return None
+            try:
+                _inspect_monitor_page(target_id, config)
+            except MonitorRiskDetected:
+                close_tab(target_id)
+                raise
             if _wait_or_stop(config, 1):
                 close_tab(target_id)
                 return None
@@ -529,7 +823,13 @@ def _open_conversation(job: dict, config: dict) -> str | None:
             if click(target_id, ".btn-startchat") or click(target_id, "[ka*='chat']"):
                 if _wait_or_stop(config, 3) or not _wait_for_page_or_stop(target_id, config, timeout=10):
                     close_tab(target_id)
+                    _record_page_failure_unless_stopped(config)
                     return None
+                try:
+                    _inspect_monitor_page(target_id, config)
+                except MonitorRiskDetected:
+                    close_tab(target_id)
+                    raise
                 if _wait_or_stop(config, 2):
                     close_tab(target_id)
                     return None
@@ -542,6 +842,7 @@ def _open_conversation(job: dict, config: dict) -> str | None:
                     return target_id
 
             close_tab(target_id)
+            _record_page_failure_unless_stopped(config)
             if attempt == 0:
                 if _wait_or_stop(config, 2):
                     return None
@@ -557,13 +858,20 @@ def _open_conversation_from_chat_list(job: dict, config: dict) -> str | None:
         return None
     monitor_cfg = config.get("monitor", {})
     chat_url = monitor_cfg.get("chat_url", "https://www.zhipin.com/web/geek/chat")
-    target_id = new_tab(chat_url, background=True)
+    target_id = _open_monitor_tab(chat_url, config)
     if not target_id:
+        _record_page_failure_unless_stopped(config)
         return None
 
     if _wait_or_stop(config, 4) or not _wait_for_page_or_stop(target_id, config, timeout=10):
         close_tab(target_id)
+        _record_page_failure_unless_stopped(config)
         return None
+    try:
+        _inspect_monitor_page(target_id, config)
+    except MonitorRiskDetected:
+        close_tab(target_id)
+        raise
     if _wait_or_stop(config, 3):
         close_tab(target_id)
         return None
@@ -640,6 +948,11 @@ def _open_conversation_from_chat_list(job: dict, config: dict) -> str | None:
             if _wait_or_stop(config, 1):
                 close_tab(target_id)
                 return None
+            try:
+                _inspect_monitor_page(target_id, config)
+            except MonitorRiskDetected:
+                close_tab(target_id)
+                raise
             return target_id
     except (json.JSONDecodeError, TypeError):
         pass
@@ -664,11 +977,17 @@ def _open_conversation_from_chat_list(job: dict, config: dict) -> str | None:
                 if _wait_or_stop(config, 1):
                     close_tab(target_id)
                     return None
+                try:
+                    _inspect_monitor_page(target_id, config)
+                except MonitorRiskDetected:
+                    close_tab(target_id)
+                    raise
                 return target_id
         except (json.JSONDecodeError, TypeError):
             pass
 
     close_tab(target_id)
+    _record_page_failure_unless_stopped(config)
     return None
 
 
@@ -724,7 +1043,7 @@ def _deliver_resume_to_chat(target_id: str) -> bool:
     return True  # Optimistic - resume dialog appeared and we clicked send
 
 
-def check_replies(config: dict) -> list[dict]:
+def _check_boss_replies(config: dict, tracked_jobs: list[dict] | None = None) -> list[dict]:
     """Open BOSS chat page and detect conversations with HR replies.
 
     Returns list of conversations with replies (including matched job info).
@@ -737,12 +1056,17 @@ def check_replies(config: dict) -> list[dict]:
     chat_url = monitor_cfg.get("chat_url", "https://www.zhipin.com/web/geek/chat")
 
     # Get jobs we've sent greetings to (or already replied/resume_sent/follow_up_sent/needs_resume - keep monitoring)
-    sent_jobs = get_jobs_by_status(db, "sent")
-    replied_jobs = get_jobs_by_status(db, "replied")
-    resume_sent_jobs = get_jobs_by_status(db, "resume_sent")
-    follow_up_jobs = get_jobs_by_status(db, "follow_up_sent")
-    needs_resume_jobs = get_jobs_by_status(db, "needs_resume")
-    all_tracked_jobs = sent_jobs + replied_jobs + resume_sent_jobs + follow_up_jobs + needs_resume_jobs
+    if tracked_jobs is None:
+        sent_jobs = get_jobs_by_status(db, "sent")
+        replied_jobs = get_jobs_by_status(db, "replied")
+        resume_sent_jobs = get_jobs_by_status(db, "resume_sent")
+        follow_up_jobs = get_jobs_by_status(db, "follow_up_sent")
+        needs_resume_jobs = get_jobs_by_status(db, "needs_resume")
+        tracked_jobs = sent_jobs + replied_jobs + resume_sent_jobs + follow_up_jobs + needs_resume_jobs
+    all_tracked_jobs = [
+        job for job in tracked_jobs
+        if str(job.get("source_platform") or "boss").strip().lower() == "boss"
+    ]
 
     if not all_tracked_jobs:
         console.print("[dim]没有需要监测的对话[/dim]")
@@ -752,16 +1076,25 @@ def check_replies(config: dict) -> list[dict]:
     console.print(f"[bold]监测 {len(all_tracked_jobs)} 个对话的回复情况...[/bold]")
 
     # Open chat page
-    target_id = new_tab(chat_url, background=True)
+    target_id = _open_monitor_tab(chat_url, config)
     if not target_id:
         console.print("[red]无法打开聊天页面[/red]")
         db.close()
+        _monitor_safety_guard(config).record_page_failure()
         return []
 
     if _wait_or_stop(config, 3) or not _wait_for_page_or_stop(target_id, config, timeout=10):
         close_tab(target_id)
         db.close()
+        if not stop_requested(config):
+            _monitor_safety_guard(config).record_page_failure()
         return []
+    try:
+        _inspect_monitor_page(target_id, config)
+    except MonitorRiskDetected:
+        close_tab(target_id)
+        db.close()
+        raise
     if _wait_or_stop(config, 2):
         close_tab(target_id)
         db.close()
@@ -777,6 +1110,7 @@ def check_replies(config: dict) -> list[dict]:
     if not raw:
         console.print("[yellow]未能获取聊天列表[/yellow]")
         db.close()
+        _monitor_safety_guard(config).record_page_failure()
         return []
 
     try:
@@ -784,7 +1118,16 @@ def check_replies(config: dict) -> list[dict]:
     except (json.JSONDecodeError, TypeError):
         console.print("[yellow]聊天列表解析失败[/yellow]")
         db.close()
+        _monitor_safety_guard(config).record_page_failure()
         return []
+
+    if not isinstance(conversations, list):
+        console.print("[yellow]聊天列表格式异常[/yellow]")
+        db.close()
+        _monitor_safety_guard(config).record_page_failure()
+        return []
+
+    _monitor_safety_guard(config).record_page_success()
 
     if not conversations:
         console.print("[dim]聊天列表为空[/dim]")
@@ -794,6 +1137,11 @@ def check_replies(config: dict) -> list[dict]:
     console.print(f"[dim]获取到 {len(conversations)} 条对话[/dim]")
 
     # Match conversations to tracked jobs and find ones with HR replies
+    raw_limit = monitor_cfg.get("max_conversations_per_cycle", 5)
+    try:
+        max_conversations = max(int(raw_limit), 1)
+    except (TypeError, ValueError):
+        max_conversations = 5
     results = []
     for conv in conversations:
         if stop_requested(config):
@@ -803,6 +1151,19 @@ def check_replies(config: dict) -> list[dict]:
 
         matched_job = _match_conversation_to_job(conv, all_tracked_jobs)
         if matched_job:
+            pending = _get_unresolved_pending_reply(db, matched_job["id"])
+            if pending and _pending_matches_chat_list(_row_text(pending, "detail"), conv):
+                console.print(
+                    f"[dim]  跳过已有待确认回复: {matched_job['company']} - {matched_job['title']}[/dim]"
+                )
+                continue
+            handled = _get_latest_handled_reply(db, matched_job["id"])
+            if handled and _handled_reply_matches_chat_list(_row_text(handled, "detail"), conv):
+                console.print(
+                    f"[dim]  跳过已处理的相同HR消息: {matched_job['company']} - {matched_job['title']}[/dim]"
+                )
+                continue
+
             # Update status to replied if it was 'sent'
             if matched_job.get("status") == "sent":
                 update_job_status(db, matched_job["id"], "replied")
@@ -815,12 +1176,28 @@ def check_replies(config: dict) -> list[dict]:
             console.print(
                 f"[green]  ✓ {matched_job['company']} - {matched_job['title']} 有新回复[/green]"
             )
+            if len(results) >= max_conversations:
+                console.print(f"[dim]本轮已达到对话处理上限 {max_conversations}[/dim]")
+                break
 
     if not results:
         console.print("[dim]暂无新回复[/dim]")
 
     db.close()
     return results
+
+
+def check_replies(config: dict) -> list[dict]:
+    """Check BOSS replies; collection-only platforms never enter chat flows."""
+    db = get_db()
+    try:
+        tracked = []
+        for status in ("sent", "replied", "resume_sent", "follow_up_sent", "needs_resume"):
+            tracked.extend(get_jobs_by_status(db, status))
+    finally:
+        db.close()
+    boss_results = _check_boss_replies(config, tracked)
+    return boss_results
 
 
 def _match_conversation_to_job(conv: dict, jobs: list[dict]) -> dict | None:
@@ -861,7 +1238,7 @@ def _match_conversation_to_job(conv: dict, jobs: list[dict]) -> dict | None:
     return None
 
 
-def _handle_conversation(job: dict, config: dict) -> str:
+def _handle_conversation(job: dict, config: dict, conversation: dict | None = None) -> str:
     """Handle a single conversation that has an HR reply.
 
     Returns action taken: 'stopped', 'skipped_user_replied',
@@ -884,7 +1261,7 @@ def _handle_conversation(job: dict, config: dict) -> str:
         close_tab(target_id)
         return "stopped"
 
-    # Extract full conversation messages
+    # Extract full BOSS conversation messages.
     raw = evaluate(target_id, JS_EXTRACT_CONVERSATION)
     if stop_requested(config):
         close_tab(target_id)
@@ -892,19 +1269,40 @@ def _handle_conversation(job: dict, config: dict) -> str:
     if not raw:
         close_tab(target_id)
         console.print("[yellow]    无法获取对话内容[/yellow]")
+        _monitor_safety_guard(config).record_page_failure()
         return "failed"
 
     try:
         messages = json.loads(raw) if isinstance(raw, str) else raw
     except (json.JSONDecodeError, TypeError):
         close_tab(target_id)
+        _monitor_safety_guard(config).record_page_failure()
         return "failed"
+    if not isinstance(messages, list):
+        close_tab(target_id)
+        return "failed"
+    messages = _reconcile_conversation_messages(messages, job)
+
+    if not isinstance(messages, list):
+        close_tab(target_id)
+        _monitor_safety_guard(config).record_page_failure()
+        return "failed"
+
+    _monitor_safety_guard(config).record_page_success()
 
     # Check if I already replied after the last HR message
     if _check_if_i_already_replied(messages):
         console.print("[dim]    我已回复，跳过本轮[/dim]")
         close_tab(target_id)
         return "skipped_user_replied"
+
+    db = get_db()
+    existing_pending_reply = _has_existing_pending_reply(db, job["id"], messages)
+    db.close()
+    if existing_pending_reply:
+        console.print("[dim]    相同HR消息已有待确认回复，跳过重复处理[/dim]")
+        close_tab(target_id)
+        return "skipped_existing_pending"
 
     # Check if HR is rejecting
     if _detect_rejection(messages):
@@ -1045,7 +1443,12 @@ def _handle_conversation(job: dict, config: dict) -> str:
             return "stopped"
         console.print("[yellow]    已生成回复建议，等待监测执行中确认[/yellow]")
         db = get_db()
-        add_history(db, job["id"], "reply_pending", _build_reply_detail(messages, reply))
+        add_history(
+            db,
+            job["id"],
+            "reply_pending",
+            _build_reply_detail(messages, reply, conversation=conversation),
+        )
         db.close()
         close_tab(target_id)
         return "reply_pending"
@@ -1078,10 +1481,98 @@ def _row_text(row, key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _get_unresolved_pending_reply(db, job_id: str):
+    """Return the latest reply suggestion only when no later decision resolved it."""
+    return db.execute(
+        """
+        SELECT h.id, h.detail
+        FROM history h
+        WHERE h.job_id = ?
+          AND h.action = 'reply_pending'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM history r
+              WHERE r.job_id = h.job_id
+                AND r.id > h.id
+                AND r.action IN ('reply_dismissed', 'replied', 'auto_replied')
+          )
+        ORDER BY h.id DESC
+        LIMIT 1
+        """,
+        (job_id,),
+    ).fetchone()
+
+
+def _get_latest_handled_reply(db, job_id: str):
+    """Return the latest resolved/handled monitor action carrying an HR fingerprint."""
+    return db.execute(
+        """
+        SELECT action, detail
+        FROM history
+        WHERE job_id = ?
+          AND action IN ('reply_dismissed', 'replied', 'auto_replied', 'needs_resume', 'resume_failed')
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (job_id,),
+    ).fetchone()
+
+
+def _pending_matches_chat_list(pending_detail: str, conversation: dict) -> bool:
+    """Avoid reopening an unresolved suggestion unless the chat list proves it changed."""
+    if conversation.get("has_unread"):
+        return False
+    current_last_message = _reply_fingerprint_from_hr_question(conversation.get("last_message", ""))
+    stored_last_message = _chat_list_fingerprint_from_detail(pending_detail)
+    if stored_last_message:
+        return stored_last_message == current_last_message
+
+    payload = _parse_reply_detail(pending_detail)
+    pending_fingerprint = _reply_fingerprint_from_detail(pending_detail)
+    if not pending_fingerprint:
+        # Legacy suggestions have no safe message identity. Keep them idempotent until
+        # the user confirms or dismisses them rather than repeatedly opening the chat.
+        return True
+    hr_question = payload.get("hr_question")
+    if isinstance(hr_question, str) and hr_question.strip():
+        pending_last_message = _reply_fingerprint_from_hr_question(hr_question.splitlines()[-1])
+    else:
+        pending_last_message = pending_fingerprint
+    return bool(current_last_message) and pending_last_message == current_last_message
+
+
+def _handled_reply_matches_chat_list(detail: str, conversation: dict) -> bool:
+    """Match a previously handled HR message without treating legacy plain text as proof."""
+    if conversation.get("has_unread"):
+        return False
+    fingerprint = _reply_fingerprint_from_detail(detail)
+    if not fingerprint:
+        return False
+    current_last_message = _reply_fingerprint_from_hr_question(conversation.get("last_message", ""))
+    payload = _parse_reply_detail(detail)
+    stored_last_message = _chat_list_fingerprint_from_detail(detail)
+    if not stored_last_message:
+        hr_question = payload.get("hr_question") or payload.get("pending_hr_question")
+        if isinstance(hr_question, str) and hr_question.strip():
+            stored_last_message = _reply_fingerprint_from_hr_question(hr_question.splitlines()[-1])
+    return bool(current_last_message) and stored_last_message == current_last_message
+
+
+def _has_existing_pending_reply(db, job_id: str, messages: list[dict]) -> bool:
+    """Return true only for the same still-unresolved HR message sequence."""
+    pending = _get_unresolved_pending_reply(db, job_id)
+    if pending is None:
+        return False
+    pending_fingerprint = _reply_fingerprint_from_detail(_row_text(pending, "detail"))
+    if not pending_fingerprint:
+        return True
+    return pending_fingerprint == _reply_fingerprint_from_messages(messages)
+
+
 def _has_generated_resume_for_job(db, job_id: str) -> bool:
     """Return true when this job already has a generated resume/request result."""
     row = db.execute(
-        "SELECT status, resume_path FROM jobs WHERE id = ?",
+        "SELECT status, resume_path FROM jobs WHERE id = ? AND deleted_at IS NULL",
         (job_id,),
     ).fetchone()
     status = _row_text(row, "status")
@@ -1212,8 +1703,6 @@ def _check_follow_ups(config: dict, throttle, replied_job_ids: set | None = None
             console.print(f"[yellow]  ! 跟进失败: {job['company']}[/yellow]")
 
         close_tab(target_id)
-        if throttle.wait(stop_event):
-            break
 
     db.close()
     return count
@@ -1260,16 +1749,30 @@ def monitor_and_send_resumes(config: dict) -> dict:
         console.print("[yellow]当前不在工作时间窗口内 (09:00-16:00)[/yellow]")
         return {"skipped": 0, "replied": 0, "needs_resume": 0, "rejected": 0, "failed": 0}
 
+    operation_multiplier = get_boss_operation_interval_multiplier(config)
     throttle = RequestThrottle(
-        throttle_config.get("interval_min", 60),
-        throttle_config.get("interval_max", 180),
+        _positive_interval_seconds(throttle_config.get("interval_min"), 60) * operation_multiplier,
+        _positive_interval_seconds(throttle_config.get("interval_max"), 180) * operation_multiplier,
     )
+    monitor_config = dict(config)
+    monitor_config["_monitor_request_throttle"] = throttle
+    monitor_config["_monitor_safety_guard"] = MonitorSafetyGuard(config)
+    monitor_config["_platform_access_guard"] = TransientPlatformAccessGuard(
+        config,
+        "monitor",
+        get_db,
+    )
+
+    summary = {"skipped": 0, "replied": 0, "needs_resume": 0, "rejected": 0, "failed": 0}
 
     # Step 1: Check for HR replies — MUST run first
     console.print("\n[bold cyan]═══ 第一步：处理HR回复 ═══[/bold cyan]")
-    replied_conversations = check_replies(config)
-
-    summary = {"skipped": 0, "replied": 0, "needs_resume": 0, "rejected": 0, "failed": 0}
+    try:
+        replied_conversations = check_replies(monitor_config)
+    except MonitorRiskDetected as exc:
+        console.print(f"[red]⚠ 监测检测到风险信号 {exc.kind}，已立即停止[/red]")
+        summary["stop_reason"] = exc.kind
+        return summary
     if stop_event and stop_event.is_set():
         return summary
 
@@ -1285,11 +1788,21 @@ def monitor_and_send_resumes(config: dict) -> dict:
                 break
             job = item["job"]
             replied_job_ids.add(job["id"])
-            action = _handle_conversation(job, config)
+            try:
+                action = _handle_conversation(job, monitor_config, item.get("conversation"))
+            except MonitorRiskDetected as exc:
+                console.print(f"[red]⚠ 监测检测到风险信号 {exc.kind}，已立即停止[/red]")
+                summary["stop_reason"] = exc.kind
+                break
 
             if action == "stopped":
                 break
-            if action in ("skipped_user_replied", "skipped_existing_resume", "skipped_dismissed_reply"):
+            if action in (
+                "skipped_user_replied",
+                "skipped_existing_resume",
+                "skipped_existing_pending",
+                "skipped_dismissed_reply",
+            ):
                 summary["skipped"] += 1
             elif action == "auto_replied":
                 summary["replied"] += 1
@@ -1299,9 +1812,6 @@ def monitor_and_send_resumes(config: dict) -> dict:
                 summary["rejected"] += 1
             else:
                 summary["failed"] += 1
-
-            if throttle.wait(stop_event):
-                break
 
         console.print("\n[bold green]═══ 回复处理完成 ═══[/bold green]")
         console.print(f"  跳过(已手动回复): {summary['skipped']}")
@@ -1317,10 +1827,15 @@ def monitor_and_send_resumes(config: dict) -> dict:
 
     # Step 3: Follow up ONLY on jobs with absolutely no HR reply
     # Pass replied_job_ids so follow-up skips any job touched this cycle
-    if stop_event and stop_event.is_set():
+    if (stop_event and stop_event.is_set()) or summary.get("stop_reason"):
         return summary
     console.print("\n[bold cyan]═══ 第二步：跟进无回复岗位 ═══[/bold cyan]")
-    follow_up_count = _check_follow_ups(config, throttle, replied_job_ids=replied_job_ids)
+    try:
+        follow_up_count = _check_follow_ups(monitor_config, throttle, replied_job_ids=replied_job_ids)
+    except MonitorRiskDetected as exc:
+        console.print(f"[red]⚠ 监测检测到风险信号 {exc.kind}，已立即停止[/red]")
+        summary["stop_reason"] = exc.kind
+        return summary
     if follow_up_count:
         console.print(f"  二次跟进: {follow_up_count}")
         summary["follow_up"] = follow_up_count

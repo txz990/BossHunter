@@ -42,6 +42,8 @@ RESUME_TAILOR_PROMPT = """你是一位专业简历顾问。请输出一份正常
 - 职位：{title}
 - 公司：{company}
 - 薪资：{salary}
+- 学历要求：{education}
+- 招聘类型：{recruitment_type}
 - 核心要求：
 {jd}
 
@@ -516,7 +518,7 @@ def generate_tailored_resume(job_id: str, config: dict) -> Path | None:
         return None
 
     # Get job info
-    row = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    row = db.execute("SELECT * FROM jobs WHERE id = ? AND deleted_at IS NULL", (job_id,)).fetchone()
     if not row:
         return fail(f"未找到岗位 ID：{job_id}")
 
@@ -541,6 +543,10 @@ def generate_tailored_resume(job_id: str, config: dict) -> Path | None:
         title=job["title"],
         company=job["company"],
         salary=job["salary"] or "面议",
+        education=job.get("education", "") or "未识别",
+        recruitment_type={"campus": "校招", "experienced": "社招"}.get(
+            job.get("recruitment_type", ""), "未识别"
+        ),
         jd=job["jd"][:2000] if job["jd"] else "无详细描述",
         resume=resume_text,
         resume_max_pages=resume_max_pages,
@@ -638,7 +644,7 @@ def generate_tailored_resume(job_id: str, config: dict) -> Path | None:
         console.print(f"[green]✓ PDF 已生成: {pdf_path}[/green]")
         # Update DB
         db.execute(
-            "UPDATE jobs SET resume_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE jobs SET resume_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND deleted_at IS NULL",
             (str(pdf_path), job_id)
         )
         db.commit()
@@ -649,7 +655,7 @@ def generate_tailored_resume(job_id: str, config: dict) -> Path | None:
         console.print(f"[yellow]PDF 渲染库未安装，已保存为 Markdown: {md_path}[/yellow]")
         console.print('[dim]  安装 PDF fallback 支持: pip install -e ".[pdf]"[/dim]')
         db.execute(
-            "UPDATE jobs SET resume_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE jobs SET resume_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND deleted_at IS NULL",
             (str(md_path), job_id)
         )
         db.commit()
@@ -665,7 +671,7 @@ def generate_all_resumes(config: dict) -> int:
 
     # Get scored jobs without resume
     rows = db.execute(
-        "SELECT id FROM jobs WHERE status IN ('scored', 'ready', 'approved') AND score >= ? AND resume_path IS NULL",
+        "SELECT id FROM jobs WHERE deleted_at IS NULL AND status IN ('scored', 'ready', 'approved') AND score >= ? AND resume_path IS NULL",
         (threshold,)
     ).fetchall()
 

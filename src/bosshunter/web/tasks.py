@@ -14,6 +14,7 @@ from bosshunter.throttle import SendWindowChecker
 MODE_LABELS = {
     "full": "运行全流程",
     "collect": "单独采集",
+    "score": "单独 AI 评分",
     "rescore": "重新评分",
     "monitor": "单独监测",
     "deliver": "确认投递",
@@ -41,6 +42,8 @@ class WorkbenchTask:
     deadline_at: str | None = None
     stop_reason: str | None = None
     stop_requested: Event = field(default_factory=Event, repr=False)
+    metrics: dict[str, int] = field(default_factory=dict)
+    progress: dict[str, Any] = field(default_factory=dict)
     context: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def snapshot(self) -> dict:
@@ -56,10 +59,32 @@ class WorkbenchTask:
             "deadline_at": self.deadline_at,
             "stop_reason": self.stop_reason,
             "stop_requested": self.stop_requested.is_set(),
+            "metrics": dict(self.metrics),
+            "progress": dict(self.progress),
         }
 
 
 Executor = Callable[[WorkbenchTask, dict], None]
+
+
+def wait_for_initial_monitor_cooldown(
+    task: WorkbenchTask,
+    config: dict,
+    log: Callable[[WorkbenchTask, str], None],
+) -> bool:
+    """Wait for the full-flow monitor cooldown; return true when cancellation wins."""
+    raw_cooldown = config.get("monitor", {}).get("initial_cooldown_minutes", 10)
+    try:
+        cooldown_sec = max(float(raw_cooldown), 0) * 60
+    except (TypeError, ValueError):
+        cooldown_sec = 10 * 60
+    if cooldown_sec <= 0:
+        return False
+    log(task, f"发送结束，首次监测将在 {cooldown_sec / 60:g} 分钟冷却后开始")
+    if task.stop_requested.wait(cooldown_sec):
+        log(task, "首次监测冷却已取消")
+        return True
+    return False
 
 
 class WorkbenchTaskRunner:

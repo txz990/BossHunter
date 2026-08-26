@@ -374,6 +374,55 @@ class AnthropicCredentialTests(unittest.TestCase):
         self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer deepseek-secret")
         self.assertEqual(post.call_args.kwargs["json"]["model"], "provider-current-model")
 
+    def test_deepseek_model_name_is_lowercased_only_in_the_outbound_request(self):
+        class CompletionResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"choices": [{"message": {"content": "ok"}}]}
+
+        config = {
+            "ai": {
+                "service": "deepseek",
+                "provider": "openai_compatible",
+                "model": "DeepSeek-V4-Flash",
+            }
+        }
+        with (
+            patch.dict("os.environ", {"DEEPSEEK_API_KEY": "deepseek-secret"}, clear=True),
+            patch("bosshunter.ai.credentials.httpx.post", return_value=CompletionResponse()) as post,
+        ):
+            credentials.call_openai_compatible_text("prompt", config, 8)
+
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "deepseek-v4-flash")
+        self.assertEqual(config["ai"]["model"], "DeepSeek-V4-Flash")
+
+    def test_custom_compatible_model_name_preserves_case_in_the_outbound_request(self):
+        class CompletionResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"choices": [{"message": {"content": "ok"}}]}
+
+        config = {
+            "ai": {
+                "service": "custom",
+                "provider": "openai_compatible",
+                "base_url": "https://compatible.example/v1",
+                "api_key": "local-test-secret",
+                "model": "Vendor/CaseSensitive-Model",
+            }
+        }
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("bosshunter.ai.credentials.httpx.post", return_value=CompletionResponse()) as post,
+        ):
+            credentials.call_openai_compatible_text("prompt", config, 8)
+
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "Vendor/CaseSensitive-Model")
+
     def test_openai_compatible_accepts_array_content(self):
         class CompletionResponse:
             def raise_for_status(self):
