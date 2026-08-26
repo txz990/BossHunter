@@ -91,6 +91,7 @@ def normalize_collection_options(config: dict[str, Any], raw_options: dict[str, 
             } if isinstance(base.get("city_codes"), dict) else {},
             "max_pages": base.get("max_pages", 3 if platform == "boss" else 1),
             "sort": str(base.get("sort") or ("newest" if platform == "boss" else "default")),
+            "company_sizes": _clean_strings(base.get("company_sizes")),
         }
 
     order = supplied.get("platform_order")
@@ -182,6 +183,7 @@ def validate_collection_options(options: dict[str, Any]) -> dict[str, Any]:
             "city_codes": city_codes,
             "max_pages": max_pages,
             "sort": sort,
+            "company_sizes": _clean_strings(value.get("company_sizes")),
         }
     return normalized
 
