@@ -109,6 +109,7 @@ def _legacy_request(config: dict, keywords: list[str]) -> PlatformCollectionRequ
         max_pages=min(_positive_int(search_config.get("max_pages", 3), 3), 10),
         sort=str(search_config.get("sort") or "default"),
         company_sizes=[str(s).strip() for s in (search_config.get("company_sizes") or []) if str(s).strip()],
+        filters=search_config.get("filters") if isinstance(search_config.get("filters"), dict) else {},
     )
 
 

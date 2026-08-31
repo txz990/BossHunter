@@ -1,0 +1,153 @@
+profile:
+  resume_path: D:\study\Code\BossHunter\data\resumes\AI-Agent开发工程师-付大成-V1.3.md
+  resume_output_dir: ./data/resumes
+  target_cities:
+    - 广州
+  education: 本科
+  recruitment_type: experienced
+  greeting_preference: ""
+  salary_min: 13
+  salary_max: 25
+  allow_internship: false
+  deal_breakers:
+    - 外包
+    - "996"
+    - 实习
+    - 应届生
+  jd_deal_breakers: []
+  blocked_companies: []
+  target_roles:
+    - 你的目标岗位1
+    - 目标岗位2
+    - 目标岗位3
+  extra_highlights:
+    - 你的核心竞争力描述
+  portfolio_url: ""
+  resume_original_filename: AI-Agent开发工程师-付大成-V1.1.docx
+search:
+  keywords:
+    - AI Agent
+    - Agent
+    - AI 应用开发
+    - AI大模型开发
+    - 智能体
+  cities:
+    - 广州
+  city_codes: {}
+  max_pages: 5
+  company_sizes:
+    - 0-20人
+    - 20-99人
+    - 100-499人
+  sort: newest
+collection:
+  default_order:
+    - boss
+  auto_score_default: true
+  daily_search_page_limit: 30
+  daily_detail_page_limit: 150
+  max_consecutive_page_failures: 3
+  risk_pause_min_minutes: 5
+  risk_pause_max_minutes: 10
+  collection_delay_multiplier: 1.5
+  delivery_cooldown_min_minutes: 5
+  delivery_cooldown_max_minutes: 15
+platforms:
+  boss:
+    enabled: true
+    search:
+      keywords:
+        - AI Agent
+        - Agent
+        - AI 应用开发
+        - AI大模型开发
+        - 智能体
+      cities:
+        - 广州
+      city_codes: {}
+      max_pages: 3
+      sort: default
+      company_sizes:
+        - 0-20人
+        - 20-99人
+        - 100-499人
+  zhilian:
+    enabled: false
+    search:
+      keywords: []
+      cities: []
+      city_codes: {}
+      max_pages: 3
+      sort: default
+  51job:
+    enabled: false
+    search:
+      keywords: []
+      cities:
+        - 上海
+      city_codes:
+        上海: "020000"
+      max_pages: 1
+      sort: default
+scoring:
+  threshold: 70
+  max_candidates: 2
+throttle:
+  daily_limit: 30
+  interval_min: 60
+  interval_max: 180
+  browse_before_greet: true
+  browse_duration_min: 15
+  browse_duration_max: 30
+  send_windows:
+    - 09:00-17:00
+  day_off_probability: 0.05
+ai:
+  provider: openai_compatible
+  service: custom
+  model: gpt-5.5
+  thinking: auto
+  thinking_budget: 2048
+  timeout_seconds: 180
+  scoring_max_tokens: 8192
+  scoring_max_attempts: 2
+  scoring_concurrency: 1
+  scoring_second_review: false
+  greeting_max_tokens: 8192
+  greeting_review_max_tokens: 4096
+  greeting_max_attempts: 2
+  greeting_review_threshold: 7
+  greeting_max_iterations: 2
+  rate_limit_max_retries: 3
+  rate_limit_backoff_seconds: 10
+  resume_max_pages: 3
+  base_url: http://localhost:17377/v1
+  api_key:
+monitor:
+  interval: 30
+  initial_cooldown_minutes: 10
+  chat_url: https://www.zhipin.com/web/geek/chat
+  max_conversations_per_cycle: 5
+  max_consecutive_page_failures: 3
+  max_resume_sends_per_cycle: 5
+  auto_reply_hr_questions: false
+follow_up:
+  enabled: false
+  interval_hours: 30
+  skip_weekends: true
+dedup:
+  history_file: ./data/history.jsonl
+safety:
+  daily_platform_page_limit: 500
+  risk_lock_minutes: 10
+browser:
+  runtime: builtin
+  proxy_host: 127.0.0.1
+  proxy_port: 3456
+  chrome_ports:
+    - 9222
+    - 9229
+    - 9333
+  auto_start_proxy: true
+  enable_port_guard: true
+  site_patterns: true

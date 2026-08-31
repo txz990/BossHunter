@@ -9,7 +9,7 @@ from typing import Any, Literal
 from bosshunter.collection.text import clean_job_description
 
 
-PlatformId = Literal["boss", "zhilian", "51job"]
+PlatformId = Literal["boss", "zhilian", "51job", "liepin"]
 
 
 def classify_recruitment_type(title: str = "", experience: str = "", jd: str = "") -> str:
@@ -35,6 +35,7 @@ class PlatformCollectionRequest:
     max_pages: int = 3
     sort: str = "default"
     company_sizes: list[str] = field(default_factory=list)
+    filters: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

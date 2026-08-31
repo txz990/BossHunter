@@ -83,11 +83,12 @@ DEFAULTS: dict[str, Any] = {
         "max_pages": 3,
         "company_sizes": [],  # Empty = no filter; otherwise filter by company size
         "sort": "default",
+        "filters": {},
     },
     "collection": {
         "default_order": ["boss"],
         "auto_score_default": False,
-        "daily_search_page_limit": 30,
+        "daily_search_page_limit": 60,
         "daily_detail_page_limit": 150,
         "max_consecutive_page_failures": 3,
         "risk_pause_min_minutes": 5,
@@ -105,6 +106,7 @@ DEFAULTS: dict[str, Any] = {
                 "city_codes": {},
                 "max_pages": 3,
                 "sort": "default",
+                "filters": {},
             },
         },
         "zhilian": {
